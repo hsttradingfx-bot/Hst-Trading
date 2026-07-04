@@ -1,0 +1,2 @@
+# Hst-Trading
+bot tradingbot 
