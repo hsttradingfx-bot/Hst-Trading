@@ -1,0 +1,29 @@
+name: Signal SOL Bot
+
+# Ce workflow lance le script de detection de signal toutes les 15 minutes.
+# GitHub Actions est gratuit pour les repos publics (illimite) et donne
+# 2000 minutes/mois gratuites pour les repos prives - largement suffisant
+# pour un script qui tourne quelques secondes toutes les 15 minutes.
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"   # toutes les 15 minutes
+  workflow_dispatch: {}       # permet aussi de le lancer manuellement depuis GitHub
+
+jobs:
+  check-signal:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout du code
+        uses: actions/checkout@v4
+
+      - name: Installer Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Verifier le signal
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python live_bot_mexc.py
