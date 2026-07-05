@@ -7,8 +7,8 @@ name: Signal SOL Bot
 
 on:
   schedule:
-    - cron: "*/5 * * * *"   # toutes les 5 minutes
-  workflow_dispatch: {}       # permet aussi de le lancer manuellement depuis GitHub
+    - cron: "*/5 * * * *" # toutes les 5 minutes
+  workflow_dispatch: {}    # permet aussi de le lancer manuellement depuis GitHub
 
 jobs:
   check-signal:
@@ -26,4 +26,7 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python live_bot_mexc.py
+        run: |
+          python live_bot_mexc.py
+          python bot2.py
+          
