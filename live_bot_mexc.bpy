@@ -1,0 +1,83 @@
+def generate_trades_r(h4, h1, m5, symbol):
+    h4_zbt, h4_zbb = compute_two_bos_zones(h4, SWING_LEN_HTF)
+    fvg_bull = compute_fvg_bull(h1)
+    ob_bull = compute_ob_bull_signals(m5, SWING_LEN_HTF, OB_LOOKBACK)
+    
+    # --- MODIFICATION : Remplacement de l'ATR par le creux précédent ---
+    # On récupère les pivots bas M5 pour trouver le creux avant l'OB
+    pl_m5 = pivot_lows(m5, SWING_LEN_HTF)
+    
+    h4_zbt_m5 = align(m5, h4, h4_zbt)
+    h4_zbb_m5 = align(m5, h4, h4_zbb)
+    fvg_bull_m5 = align(m5, h1, fvg_bull)
+
+    def fvg_in_h4_zone_bull(i):
+        if h4_zbt_m5[i] is None or fvg_bull_m5[i] is None: return False
+        gb, gt = fvg_bull_m5[i]
+        return gb < h4_zbt_m5[i] and gt > h4_zbb_m5[i]
+
+    def retest_of_fvg_zone(i):
+        if fvg_bull_m5[i] is None: return False
+        gb, gt = fvg_bull_m5[i]
+        return m5[i]["low"] <= gt and m5[i]["high"] >= gb
+
+    trades_r = []
+    open_trade = None
+    daily_trade_count = 0
+    consec_sl = 0
+    current_day = None
+
+    for i in range(len(m5)):
+        c = m5[i]
+        day = c["ts"] // 86400
+        if day != current_day:
+            current_day, daily_trade_count, consec_sl = day, 0, 0
+
+        if open_trade is not None:
+            entry_price, sl, tp, r_unit, entry_ts, stage, realized_r = open_trade
+            tp1_level = entry_price + TP1_R * r_unit
+            tp2_level = entry_price + TP2_R * r_unit
+
+            if stage == 0:
+                if c["low"] <= sl:
+                    trades_r.append((entry_ts, symbol, -1.0))
+                    consec_sl, open_trade = consec_sl + 1, None
+                    continue
+                if c["high"] >= tp1_level:
+                    open_trade = (entry_price, entry_price, tp, r_unit, entry_ts, 1, realized_r + TP1_FRACTION * TP1_R)
+                    continue
+            elif stage == 1:
+                if c["low"] <= sl:
+                    trades_r.append((entry_ts, symbol, realized_r))
+                    open_trade = None
+                    continue
+                if c["high"] >= tp2_level:
+                    open_trade = (entry_price, entry_price + RUNNER_STOP_AFTER_TP2_R * r_unit, tp, r_unit, entry_ts, 2, realized_r + TP2_FRACTION * TP2_R)
+                    continue
+            elif stage == 2:
+                if c["low"] <= sl:
+                    trades_r.append((entry_ts, symbol, realized_r + RUNNER_FRACTION * RUNNER_STOP_AFTER_TP2_R))
+                    open_trade = None
+                    continue
+                if c["high"] >= tp:
+                    trades_r.append((entry_ts, symbol, realized_r + RUNNER_FRACTION * ((tp - entry_price) / r_unit)))
+                    open_trade = None
+                    continue
+
+        if daily_trade_count >= MAX_DAILY_TRADES or consec_sl >= MAX_CONSEC_SL: continue
+        if to_cet_datetime(c["ts"]).hour not in ENTRY_HOURS_PARIS: continue
+
+        # --- LOGIQUE DE SL : Creux précédent ---
+        last_low = pl_last_before(pl_m5, i)
+        
+        if h4_zbt_m5[i] is not None and fvg_in_h4_zone_bull(i) and retest_of_fvg_zone(i) and ob_bull[i] is not None:
+            if last_low is not None and last_low < ob_bull[i]:
+                entry_price = ob_bull[i]
+                sl = last_low # Le stop est maintenant le creux précédent
+                tp = h4_zbt_m5[i]
+                r_unit = entry_price - sl
+                if tp > entry_price and r_unit > 0:
+                    open_trade = (entry_price, sl, tp, r_unit, c["ts"], 0, 0.0)
+                    daily_trade_count += 1
+    return trades_r
+    
