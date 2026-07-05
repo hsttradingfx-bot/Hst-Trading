@@ -1,7 +1,7 @@
 """
 BOT 1 - ALERTES MULTI-CRYPTO - MEXC Futures (BTC, ETH, SOL)
 ===========================================================
-Générateur de signaux Telegram pour exécution manuelle.
+Générateur de signaux Telegram anticipés pour exécution manuelle (Ordres Limites).
 Aucune clé API MEXC requise (données de marché publiques).
 """
 
@@ -17,7 +17,7 @@ import bisect
 from datetime import datetime
 
 # ============================================================
-# TELEGRAM (Identifiants configurés)
+# TELEGRAM (Identifiants validés)
 # ============================================================
 TELEGRAM_BOT_TOKEN = "8831744843:AAE0-QkkzoglBIjte54M1xSKEVUYJVWdy_4"
 TELEGRAM_CHAT_ID = "8356059748"
@@ -36,7 +36,7 @@ def send_telegram(message):
 # ============================================================
 # CONFIGURATION DU SYSTEME
 # ============================================================
-BOT_NAME = "🤖 BOT 1 (H4/H1/M5)"
+BOT_NAME = "🤖 BOT 1 (ORDRE LIMITE - H4/H1/M5)"
 BASE_URL = "https://contract.mexc.com"
 
 # Les 3 paires analysées simultanément
@@ -282,7 +282,7 @@ def compute_ob_signals(candles, length, ob_lookback=8):
 
 
 # ============================================================
-# EXÉCUTION DE L'ANALYSE
+# EXÉCUTION DE L'ANALYSE AVEC ALERTE ANTICIPÉE (ORDRE LIMITE)
 # ============================================================
 def analyze_asset(symbol):
     print(f"🔍 Scan en cours : {symbol}...")
@@ -313,32 +313,48 @@ def analyze_asset(symbol):
     epa_bull_bounds = fvg_bull_bounds[idx_h1]
     atr_val = atr_m5[i]
 
+    # Alignement macro : FVG H1 est bien imbriqué dans la zone haussière H4
     fvg_in_zone = (zone_top_bull is not None and epa_bull_bounds is not None and
                    epa_bull_bounds[0] < zone_top_bull and epa_bull_bounds[1] > zone_bottom_bull)
 
-    if fvg_in_zone and ob_bull_signal[i] is not None and atr_val is not None:
-        entry_price = ob_bull_signal[i]
-        sl = entry_price - atr_val * SL_BUFFER_ATR_MULT
-        tp = zone_top_bull
+    if fvg_in_zone and atr_val is not None:
+        # STRATÉGIE ANTICIPÉE : On cherche l'OB le plus récent créé sur les dernières bougies.
+        # Si cet OB n'a pas encore été retouché par le prix actuel, on envoie le signal pour placer un Ordre Limite.
+        target_ob = None
+        for check_idx in range(i, i - 15, -1):
+            if check_idx >= 0 and ob_bull_signal[check_idx] is not None:
+                target_ob = ob_bull_signal[check_idx]
+                break
         
-        if tp > entry_price and sl < entry_price:
-            risk_amount = CAPITAL_ESTIME * (RISK_PCT / 100)
-            sl_dist = entry_price - sl
-            qty = round(risk_amount / sl_dist, 4)
-            ticker_name = symbol.split("_")[0]
+        if target_ob is not None:
+            current_price = m5[i]["close"]
             
-            msg = (f"{BOT_NAME} - 🟢 *SIGNAL D'ACHAT {symbol}*\n"
-                   f"━━━━━━━━━━━━━━━━━━\n"
-                   f"🔹 *Entrée (OB)* : `{entry_price}`\n"
-                   f"🛑 *Stop Loss* : `{sl}`\n"
-                   f"🎯 *Take Profit (H4 Top)* : `{tp}`\n"
-                   f"━━━━━━━━━━━━━━━━━━\n"
-                   f"📊 *Gestion des risques :*\n"
-                   f"▪️ Risque configuré : {RISK_PCT}%\n"
-                   f"▪️ Capital virtuel : {CAPITAL_ESTIME} USDT\n"
-                   f"🧮 *Taille de position estimée* : `{qty} {ticker_name}`")
-                   
-            send_telegram(msg)
+            # Si le prix actuel est encore AU-DESSUS de l'OB, on a le temps de poser une limite !
+            if current_price > target_ob:
+                entry_price = target_ob
+                sl = entry_price - atr_val * SL_BUFFER_ATR_MULT
+                tp = zone_top_bull
+                
+                if tp > entry_price and sl < entry_price:
+                    risk_amount = CAPITAL_ESTIME * (RISK_PCT / 100)
+                    sl_dist = entry_price - sl
+                    qty = round(risk_amount / sl_dist, 4)
+                    ticker_name = symbol.split("_")[0]
+                    
+                    msg = (f"{BOT_NAME}\n"
+                           f"🟢 *ORDRE LIMITE RECOMMANDÉ - {symbol}*\n"
+                           f"━━━━━━━━━━━━━━━━━━\n"
+                           f"⏳ _Place ton ordre sur MEXC à l'avance !_\n\n"
+                           f"🔹 *Type d'ordre* : `LIMIT (Achat / Long)`\n"
+                           f"🔹 *Prix d'Entrée* : `{entry_price}`\n"
+                           f"🛑 *Stop Loss* : `{sl}`\n"
+                           f"🎯 *Take Profit* : `{tp}`\n"
+                           f"━━━━━━━━━━━━━━━━━━\n"
+                           f"📊 *Gestion du Capital (Sprint 100€) :*\n"
+                           f"▪️ Risque : {RISK_PCT}% ({risk_amount} USDT)\n"
+                           f"🧮 *Taille à saisir* : `{qty} {ticker_name}`")
+                           
+                    send_telegram(msg)
 
 
 def run_signal_check():
@@ -350,8 +366,8 @@ def run_signal_check():
 
 if __name__ == "__main__":
     # --- TEST DE CONNEXION TELEGRAM AUTOMATIQUE ---
-    print("🚀 Envoi d'un message de test à Telegram...")
-    send_telegram("🔔 **TEST BOT 1** : Si tu reçois ce message, ton Token et ton Chat ID fonctionnent à 100% ! Prêt pour le scan.")
+    print("🚀 Envoi du message d'initialisation...")
+    send_telegram("🔔 **BOT 1 ACTIVÉ** : Version Ordres Limites (Anticipation) opérationnelle sur BTC, ETH et SOL !")
     
     # --- LANCEMENT DE L'ANALYSE ---
     run_signal_check()
