@@ -1,117 +1,94 @@
 """
-Bot de signal LIVE - Strategie H4 (biais 2 cassures) + H1 (1 cassure+FVG) + M5 (2 cassures+retest OB)
-==========================================================================================================
-Version ACHAT UNIQUEMENT, SANS Daily (H4 seul comme filtre macro), sur 3 paires : BTC, ETH, SOL.
-Validee sur ~981 trades combines (3 actifs, walk-forward), win rate 52-67% selon l'actif et la periode.
-Signal-only : envoie une notification Telegram par paire, ne passe AUCUN ordre.
-
-Donnees via l'API publique MEXC Futures (meme exchange que celui utilise pour executer les trades,
-donc plus besoin de comparer un prix Binance a un prix MEXC au moment d'agir sur un signal).
-
-A executer via GitHub Actions toutes les 15 minutes (ou en local).
+BOT 1 - ALERTES MULTI-CRYPTO - MEXC Futures (BTC, ETH, SOL)
+===========================================================
+Générateur de signaux Telegram pour exécution manuelle.
+Aucune clé API MEXC requise (données de marché publiques).
 """
 
+import hmac
+import hashlib
 import json
-import os
 import time
-from datetime import datetime, timezone
 import urllib.request
+import urllib.error
+import urllib.parse
+import os
 import bisect
+from datetime import datetime
 
 # ============================================================
-# CONFIGURATION (identique a la version validee en backtest)
+# TELEGRAM (Identifiants configurés)
 # ============================================================
-SYMBOLS = ["BTC_USDT", "ETH_USDT", "SOL_USDT"]   # notation MEXC (underscore, pas comme Binance)
-BASE_URL = "https://contract.mexc.com/api/v1/contract/kline/"
+TELEGRAM_BOT_TOKEN = "8831744843:AAE0-QkkzoglBIjte54M1xSKEVUYJVWdy_4"
+TELEGRAM_CHAT_ID = "8831744843"
 
-# Fenetres reduites vs le backtest (pas besoin de 900j d'historique pour verifier l'etat ACTUEL,
-# juste assez de recul pour reconstruire correctement l'etat des zones)
-DAYS_BACK_H4 = 250
-DAYS_BACK_H1 = 80
-DAYS_BACK_M5 = 15
 
-SWING_LEN_HTF = 2
+def send_telegram(message):
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    data = urllib.parse.urlencode({"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}).encode()
+    req = urllib.request.Request(url, data=data, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            resp.read()
+    except Exception as e:
+        print(f"Erreur envoi Telegram : {e}")
+
+# ============================================================
+# CONFIGURATION DU SYSTEME
+# ============================================================
+BOT_NAME = "🤖 BOT 1 (H4/H1/M5)"
+BASE_URL = "https://contract.mexc.com"
+
+# Les 3 paires analysées simultanément
+SYMBOLS = ["BTC_USDT", "ETH_USDT", "SOL_USDT"]
+
+# Gestion du risque (Sprint initial)
+RISK_PCT = 10.0
+CAPITAL_ESTIME = 100.0  
+
+# Paramètres techniques de la stratégie Bot 1
+SWING_LEN_H4 = 2
 SWING_LEN_H1 = 2
+SWING_LEN_EXEC = 3
+FVG_FILL_LEVEL = 0.5
 ATR_LEN = 14
-SL_BUFFER_ATR_MULT = 0.15
-OB_LOOKBACK = 8
-
-MEXC_INTERVAL = {"Min5": "Min5", "Min60": "Min60", "Hour4": "Hour4"}   # MEXC utilise deja ces noms
-INTERVAL_SECONDS = {"Min5": 300, "Min60": 3600, "Hour4": 14400}
-
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
-
+SL_BUFFER_ATR_MULT = 0.1
 
 # ============================================================
-# RECUPERATION DES DONNEES (MEXC Futures)
+# RECUPERATION DES DONNEES DE MARCHE
 # ============================================================
-def fetch_klines_batch(symbol, interval, start=None, end=None):
-    mexc_interval = MEXC_INTERVAL[interval]
-    url = f"{BASE_URL}{symbol}?interval={mexc_interval}"
-    if start is not None:
-        url += f"&start={start}"
-    if end is not None:
-        url += f"&end={end}"
+def fetch_klines(symbol, interval, limit_days=10):
+    end_ts = int(time.time() * 1000)
+    start_ts = end_ts - (limit_days * 86400 * 1000)
+    
+    url = f"{BASE_URL}/api/v1/contract/kline/{symbol}?interval={interval}&start={start_ts}&end={end_ts}"
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-    with urllib.request.urlopen(req, timeout=15) as resp:
-        raw = json.loads(resp.read().decode())
-    if not raw.get("success"):
-        raise RuntimeError(f"Erreur API MEXC : {raw}")
-    d = raw["data"]
-    candles = []
-    for i in range(len(d["time"])):
-        candles.append({
-            "ts": d["time"][i], "open": float(d["open"][i]), "high": float(d["high"][i]),
-            "low": float(d["low"][i]), "close": float(d["close"][i]),
-        })
-    candles.sort(key=lambda c: c["ts"])
-    return candles
-
-
-def fetch_klines(symbol, interval, days_back):
-    interval_sec = INTERVAL_SECONDS[interval]
-    end_ts = int(time.time())
-    start_ts = end_ts - days_back * 86400
-    all_candles = []
-    cur_end = end_ts
-    safety_counter = 0
-    max_batches = 200
-
-    while safety_counter < max_batches:
-        safety_counter += 1
-        batch = fetch_klines_batch(symbol, interval, start=start_ts, end=cur_end)
-        if not batch:
-            break
-        all_candles = batch + all_candles
-        earliest = batch[0]["ts"]
-        if earliest <= start_ts or len(batch) < 2:
-            break
-        cur_end = earliest - interval_sec
-        time.sleep(0.15)
-
-    seen = {c["ts"]: c for c in all_candles}
-    result = sorted(seen.values(), key=lambda c: c["ts"])
-    return [c for c in result if c["ts"] >= start_ts]
-
+    
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            raw = json.loads(resp.read().decode())
+        
+        if "data" not in raw or not raw["data"] or "time" not in raw["data"]:
+            return []
+            
+        d = raw["data"]
+        candles = []
+        for i in range(len(d["time"])):
+            candles.append({
+                "ts": d["time"][i], 
+                "open": float(d["open"][i]), 
+                "high": float(d["high"][i]),
+                "low": float(d["low"][i]), 
+                "close": float(d["close"][i]),
+            })
+        return candles
+    except Exception as e:
+        print(f"Erreur klines {symbol} ({interval}) : {e}")
+        return []
 
 # ============================================================
-# INDICATEURS (identiques au backtest valide)
+# INDICATEURS ET LOGIQUE DE STRATEGIE
 # ============================================================
-def compute_atr(candles, length=ATR_LEN):
-    atr_vals = [None] * len(candles)
-    trs = []
-    for i in range(len(candles)):
-        tr = candles[i]["high"] - candles[i]["low"] if i == 0 else max(
-            candles[i]["high"] - candles[i]["low"],
-            abs(candles[i]["high"] - candles[i - 1]["close"]),
-            abs(candles[i]["low"] - candles[i - 1]["close"]))
-        trs.append(tr)
-        if i >= length - 1:
-            atr_vals[i] = sum(trs[i - length + 1:i + 1]) / length
-    return atr_vals
-
-
 def pivot_highs(candles, length):
     result = [None] * len(candles)
     for i in range(length, len(candles) - length):
@@ -152,47 +129,51 @@ def pivot_lows_raw(candles, length):
     return result
 
 
-def pl_last_before(pl, i):
-    for k in range(i, -1, -1):
-        if pl[k] is not None:
-            return pl[k]
-    return None
+def compute_atr(candles, length=ATR_LEN):
+    atr_vals = [None] * len(candles)
+    trs = []
+    for i in range(len(candles)):
+        tr = candles[i]["high"] - candles[i]["low"] if i == 0 else max(
+            candles[i]["high"] - candles[i]["low"],
+            abs(candles[i]["high"] - candles[i - 1]["close"]),
+            abs(candles[i]["low"] - candles[i - 1]["close"]))
+        trs.append(tr)
+        if i >= length - 1:
+            atr_vals[i] = sum(trs[i - length + 1:i + 1]) / length
+    return atr_vals
 
 
-def ph_last_before(ph, i):
-    for k in range(i, -1, -1):
-        if ph[k] is not None:
-            return ph[k]
-    return None
-
-
-def compute_two_bos_zones(candles, length):
-    ph = pivot_highs(candles, length)
-    pl = pivot_lows(candles, length)
+def compute_h4_bias_zones(candles, length):
+    ph, pl = pivot_highs(candles, length), pivot_lows(candles, length)
     n = len(candles)
     zone_bull_top, zone_bull_bottom = [None] * n, [None] * n
-
+    zone_bear_top, zone_bear_bottom = [None] * n, [None] * n
     last_ph = last_pl = None
     bull_stage, bull_creux, bull_sommet1 = 0, None, None
     bull_waiting_confirm, bull_pending_level, bull_sommet2_candidate = False, None, None
     bull_zone_active, bull_zone_top, bull_zone_bottom = False, None, None
+    bear_stage, bear_sommet, bear_sommet1 = 0, None, None
+    bear_waiting_confirm, bear_pending_level, bear_creux2_candidate = False, None, None
+    bear_zone_active, bear_zone_top, bear_zone_bottom = False, None, None
+
+    def pl_last_before(pl, i):
+        for k in range(i, -1, -1):
+            if pl[k] is not None:
+                return pl[k]
+        return None
+
+    def ph_last_before(ph, i):
+        for k in range(i, -1, -1):
+            if ph[k] is not None:
+                return ph[k]
+        return None
 
     for i in range(n):
         c, o = candles[i]["close"], candles[i]["open"]
-
         if last_ph is not None and c > last_ph and not bull_waiting_confirm and bull_stage in (0, 1):
             bull_waiting_confirm, bull_pending_level = True, last_ph
             if bull_stage == 0:
                 bull_creux = pl_last_before(pl, i)
-
-        if bull_zone_active and bull_zone_top is not None and c > bull_zone_top and not bull_waiting_confirm:
-            bull_waiting_confirm = True
-            bull_pending_level = bull_zone_top
-            bull_sommet1 = bull_zone_top
-            bull_creux = pl_last_before(pl, i)
-            bull_stage = 1
-            bull_sommet2_candidate = None
-
         if bull_waiting_confirm and c < o:
             if bull_stage == 0:
                 bull_sommet1, bull_stage = bull_pending_level, 1
@@ -205,80 +186,75 @@ def compute_two_bos_zones(candles, length):
                 else:
                     bull_stage, bull_sommet1, bull_sommet2_candidate, bull_creux = 0, None, None, None
             bull_waiting_confirm = False
-
-        if bull_stage == 1 and ph[i] is not None and bull_sommet1 is not None and ph[i] > bull_sommet1:
+        if bull_stage == 1 and ph[i] is not None and ph[i] > bull_sommet1:
             bull_sommet2_candidate = ph[i]
-
         if bull_zone_active and bull_zone_bottom is not None and c < bull_zone_bottom:
             bull_zone_active, bull_stage = False, 0
             bull_sommet1 = bull_sommet2_candidate = bull_creux = None
-
         zone_bull_top[i] = bull_zone_top if bull_zone_active else None
         zone_bull_bottom[i] = bull_zone_bottom if bull_zone_active else None
 
-        if ph[i] is not None:
-            last_ph = ph[i]
-        if pl[i] is not None:
-            last_pl = pl[i]
-
-    return zone_bull_top, zone_bull_bottom
-
-
-def compute_single_bos_bull(candles, length):
-    ph = pivot_highs(candles, length)
-    pl = pivot_lows(candles, length)
-    n = len(candles)
-    bias_bull = [False] * n
-
-    last_ph = last_pl = None
-    waiting_bull, pending_bull = False, None
-    waiting_bear, pending_bear = False, None
-    current_bias = None
-
-    for i in range(n):
-        c, o = candles[i]["close"], candles[i]["open"]
-
-        if last_ph is not None and c > last_ph and not waiting_bull:
-            waiting_bull, pending_bull = True, last_ph
-        if waiting_bull and c < o and c < pending_bull:
-            current_bias = "bull"
-            waiting_bull = False
-
-        if last_pl is not None and c < last_pl and not waiting_bear:
-            waiting_bear, pending_bear = True, last_pl
-        if waiting_bear and c > o and c > pending_bear:
-            current_bias = "bear"
-            waiting_bear = False
-
-        bias_bull[i] = current_bias == "bull"
+        if last_pl is not None and c < last_pl and not bear_waiting_confirm and bear_stage in (0, 1):
+            bear_waiting_confirm, bear_pending_level = True, last_pl
+            if bear_stage == 0:
+                bear_sommet = ph_last_before(ph, i)
+        if bear_waiting_confirm and c > o:
+            if bear_stage == 0:
+                bear_sommet1, bear_stage = bear_pending_level, 1
+            elif bear_stage == 1:
+                bear_zone_bottom = bear_creux2_candidate if bear_creux2_candidate is not None else bear_pending_level
+                bear_zone_top = bear_sommet
+                bear_zone_active = bear_zone_top is not None and bear_zone_bottom is not None and bear_zone_top > bear_zone_bottom
+                if bear_zone_active:
+                    bear_stage = 2
+                else:
+                    bear_stage, bear_sommet1, bear_creux2_candidate, bear_sommet = 0, None, None, None
+            bear_waiting_confirm = False
+        if bear_stage == 1 and pl[i] is not None and pl[i] < bear_sommet1:
+            bear_creux2_candidate = pl[i]
+        if bear_zone_active and bear_zone_top is not None and c > bear_zone_top:
+            bear_zone_active, bear_stage = False, 0
+            bear_sommet1 = bear_creux2_candidate = bear_sommet = None
+        zone_bear_top[i] = bear_zone_top if bear_zone_active else None
+        zone_bear_bottom[i] = bear_zone_bottom if bear_zone_active else None
 
         if ph[i] is not None:
             last_ph = ph[i]
         if pl[i] is not None:
             last_pl = pl[i]
 
-    return bias_bull
+    return zone_bull_top, zone_bull_bottom, zone_bear_top, zone_bear_bottom
 
 
-def compute_h1_fvg_bull(candles):
+def compute_h1_fvg_epa(candles):
     n = len(candles)
-    fvg_bull_bounds = [None] * n
-    active_bull = None
+    fvg_bull_epa, fvg_bear_epa = [None] * n, [None] * n
+    fvg_bull_bounds, fvg_bear_bounds = [None] * n, [None] * n
+    active_bull_fvg = active_bear_fvg = None
     for i in range(2, n):
         c1, c3 = candles[i - 2], candles[i]
         if c3["low"] > c1["high"]:
-            active_bull = (c1["high"], c3["low"])
-        if active_bull is not None and candles[i]["close"] < active_bull[0]:
-            active_bull = None
-        fvg_bull_bounds[i] = active_bull
-    return fvg_bull_bounds
+            gap_bottom, gap_top = c1["high"], c3["low"]
+            active_bull_fvg = (gap_bottom, gap_top, gap_bottom + (gap_top - gap_bottom) * FVG_FILL_LEVEL)
+        if c3["high"] < c1["low"]:
+            gap_top, gap_bottom = c1["low"], c3["high"]
+            active_bear_fvg = (gap_bottom, gap_top, gap_bottom + (gap_top - gap_bottom) * (1 - FVG_FILL_LEVEL))
+        if active_bull_fvg is not None and candles[i]["close"] < active_bull_fvg[0]:
+            active_bull_fvg = None
+        if active_bear_fvg is not None and candles[i]["close"] > active_bear_fvg[1]:
+            active_bear_fvg = None
+        fvg_bull_epa[i] = active_bull_fvg[2] if active_bull_fvg else None
+        fvg_bear_epa[i] = active_bear_fvg[2] if active_bear_fvg else None
+        fvg_bull_bounds[i] = (active_bull_fvg[0], active_bull_fvg[1]) if active_bull_fvg else None
+        fvg_bear_bounds[i] = (active_bear_fvg[0], active_bear_fvg[1]) if active_bear_fvg else None
+    return fvg_bull_epa, fvg_bear_epa, fvg_bull_bounds, fvg_bear_bounds
 
 
-def compute_ob_bull_signals(candles, length, ob_lookback=OB_LOOKBACK):
-    pl_raw = pivot_lows_raw(candles, length)
-    ph = pivot_highs(candles, length)
+def compute_ob_signals(candles, length, ob_lookback=8):
+    ph_raw, pl_raw = pivot_highs_raw(candles, length), pivot_lows_raw(candles, length)
+    ph, pl = pivot_highs(candles, length), pivot_lows(candles, length)
     n = len(candles)
-    ob_bull_signal = [None] * n
+    ob_bull_signal, ob_bear_signal = [None] * n, [None] * n
     for i in range(n):
         if ph[i] is not None:
             low_keys = [k for k in pl_raw.keys() if k <= i]
@@ -291,102 +267,91 @@ def compute_ob_bull_signals(candles, length, ob_lookback=OB_LOOKBACK):
                     if candles[idx]["close"] < candles[idx]["open"]:
                         ob_bull_signal[i] = candles[idx]["low"]
                         break
-    return ob_bull_signal
-
-
-def align(target_candles, source_candles, source_values):
-    source_ts = [c["ts"] for c in source_candles]
-    aligned = []
-    for c in target_candles:
-        idx = bisect.bisect_right(source_ts, c["ts"]) - 1
-        aligned.append(source_values[idx] if idx >= 0 else None)
-    return aligned
-
-
-# ============================================================
-# TELEGRAM
-# ============================================================
-def send_telegram_message(text):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("ATTENTION : TELEGRAM_BOT_TOKEN ou TELEGRAM_CHAT_ID non configure. Message non envoye :")
-        print(text)
-        return
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    data = json.dumps({"chat_id": TELEGRAM_CHAT_ID, "text": text}).encode()
-    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
-    try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            resp.read()
-        print("Message Telegram envoye.")
-    except Exception as e:
-        print(f"Erreur envoi Telegram : {e}")
+        if pl[i] is not None:
+            high_keys = [k for k in ph_raw.keys() if k <= i]
+            if high_keys:
+                swing_bar = max(high_keys)
+                for m in range(0, ob_lookback + 1):
+                    idx = swing_bar - m
+                    if idx < 0:
+                        break
+                    if candles[idx]["close"] > candles[idx]["open"]:
+                        ob_bear_signal[i] = candles[idx]["high"]
+                        break
+    return ob_bull_signal, ob_bear_signal
 
 
 # ============================================================
-# VERIFICATION DU SIGNAL (etat actuel uniquement, derniere bougie M5)
+# EXÉCUTION DE L'ANALYSE
 # ============================================================
-def check_signal_for_symbol(symbol):
-    print(f"[{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}] Verification {symbol} (H4+H1+M5, sans Daily, achat uniquement)...")
+def analyze_asset(symbol):
+    print(f"🔍 Scan en cours : {symbol}...")
+    h4 = fetch_klines(symbol, "Hour4", limit_days=250)
+    h1 = fetch_klines(symbol, "Min60", limit_days=80)
+    m5 = fetch_klines(symbol, "Min5", limit_days=6)
 
-    h4 = fetch_klines(symbol, "Hour4", DAYS_BACK_H4)
-    h1 = fetch_klines(symbol, "Min60", DAYS_BACK_H1)
-    m5 = fetch_klines(symbol, "Min5", DAYS_BACK_M5)
-
-    if len(m5) < 50:
-        print(f"  {symbol} : pas assez de bougies M5 recuperees, on abandonne ce cycle.")
+    if not h4 or not h1 or not m5:
         return
 
-    h4_zbt, h4_zbb = compute_two_bos_zones(h4, SWING_LEN_HTF)
-    h1_bull_bos = compute_single_bos_bull(h1, SWING_LEN_H1)
-    fvg_bull = compute_h1_fvg_bull(h1)
-    m5_zbt, m5_zbb = compute_two_bos_zones(m5, SWING_LEN_HTF)
-    ob_bull = compute_ob_bull_signals(m5, SWING_LEN_HTF, OB_LOOKBACK)
+    zbt, zbb, zrt, zrb = compute_h4_bias_zones(h4, SWING_LEN_H4)
+    fvg_bull_epa, fvg_bear_epa, fvg_bull_bounds, fvg_bear_bounds = compute_h1_fvg_epa(h1)
+    ob_bull_signal, ob_bear_signal = compute_ob_signals(m5, SWING_LEN_EXEC)
     atr_m5 = compute_atr(m5)
 
-    h4_zbt_m5 = align(m5, h4, h4_zbt)
-    h4_zbb_m5 = align(m5, h4, h4_zbb)
-    h1_bull_bos_m5 = align(m5, h1, h1_bull_bos)
-    fvg_bull_m5 = align(m5, h1, fvg_bull)
+    i = len(m5) - 1
+    h4_ts = [c["ts"] for c in h4]
+    h1_ts = [c["ts"] for c in h1]
+    
+    idx_h4 = bisect.bisect_right(h4_ts, m5[i]["ts"]) - 1
+    idx_h1 = bisect.bisect_right(h1_ts, m5[i]["ts"]) - 1
 
-    i = len(m5) - 1  # derniere bougie M5 cloturee
+    if idx_h4 < 0 or idx_h1 < 0 or idx_h4 >= len(zbt) or idx_h1 >= len(fvg_bull_bounds):
+        return
 
-    macro_bull = h4_zbt_m5[i] is not None   # Daily retire : H4 seul suffit
+    zone_top_bull = zbt[idx_h4]
+    zone_bottom_bull = zbb[idx_h4]
+    epa_bull_bounds = fvg_bull_bounds[idx_h1]
+    atr_val = atr_m5[i]
 
-    fvg_in_zone = False
-    if h4_zbt_m5[i] is not None and fvg_bull_m5[i] is not None:
-        gb, gt = fvg_bull_m5[i]
-        fvg_in_zone = gb < h4_zbt_m5[i] and gt > h4_zbb_m5[i]
+    fvg_in_zone = (zone_top_bull is not None and epa_bull_bounds is not None and
+                   epa_bull_bounds[0] < zone_top_bull and epa_bull_bounds[1] > zone_bottom_bull)
 
-    signal_ok = (macro_bull and h1_bull_bos_m5[i] and fvg_in_zone
-                 and m5_zbt[i] is not None and ob_bull[i] is not None and atr_m5[i] is not None)
+    if fvg_in_zone and ob_bull_signal[i] is not None and atr_val is not None:
+        entry_price = ob_bull_signal[i]
+        sl = entry_price - atr_val * SL_BUFFER_ATR_MULT
+        tp = zone_top_bull
+        
+        if tp > entry_price and sl < entry_price:
+            risk_amount = CAPITAL_ESTIME * (RISK_PCT / 100)
+            sl_dist = entry_price - sl
+            qty = round(risk_amount / sl_dist, 4)
+            ticker_name = symbol.split("_")[0]
+            
+            msg = (f"{BOT_NAME} - 🟢 *SIGNAL D'ACHAT {symbol}*\n"
+                   f"━━━━━━━━━━━━━━━━━━\n"
+                   f"🔹 *Entrée (OB)* : `{entry_price}`\n"
+                   f"🛑 *Stop Loss* : `{sl}`\n"
+                   f"🎯 *Take Profit (H4 Top)* : `{tp}`\n"
+                   f"━━━━━━━━━━━━━━━━━━\n"
+                   f"📊 *Gestion des risques :*\n"
+                   f"▪️ Risque configuré : {RISK_PCT}%\n"
+                   f"▪️ Capital virtuel : {CAPITAL_ESTIME} USDT\n"
+                   f"🧮 *Taille de position estimée* : `{qty} {ticker_name}`")
+                   
+            send_telegram(msg)
 
-    if signal_ok:
-        entry_price = ob_bull[i]
-        sl = entry_price - atr_m5[i] * SL_BUFFER_ATR_MULT
-        tp = m5_zbt[i]
-        prix_actuel = m5[i]["close"]
 
-        message = (
-            f"SIGNAL ACHAT {symbol}\n"
-            f"Prix actuel : {prix_actuel:.4f}\n"
-            f"Entree (OB retest) : {entry_price:.4f}\n"
-            f"SL : {sl:.4f}\n"
-            f"TP : {tp:.4f}\n"
-            f"R:R approx : {((tp-entry_price)/(entry_price-sl)):.1f}"
-        )
-        print(message)
-        send_telegram_message(message)
-    else:
-        print(f"  {symbol} : aucun signal pour l'instant.")
-
-
-def check_all_symbols():
+def run_signal_check():
+    print(f"[{datetime.now()}] 🚀 Lancement du scan global sur : {', '.join(SYMBOLS)}...")
     for symbol in SYMBOLS:
-        try:
-            check_signal_for_symbol(symbol)
-        except Exception as e:
-            print(f"  {symbol} : erreur pendant la verification -> {e}")
+        analyze_asset(symbol)
+    print(f"[{datetime.now()}] ✅ Fin du scan.")
 
 
 if __name__ == "__main__":
-    check_all_symbols()
+    # --- TEST DE CONNEXION TELEGRAM AUTOMATIQUE ---
+    print("🚀 Envoi d'un message de test à Telegram...")
+    send_telegram("🔔 **TEST BOT 1** : Si tu reçois ce message, ton Token et ton Chat ID fonctionnent à 100% ! Prêt pour le scan.")
+    
+    # --- LANCEMENT DE L'ANALYSE ---
+    run_signal_check()
