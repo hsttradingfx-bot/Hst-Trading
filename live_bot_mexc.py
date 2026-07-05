@@ -5,6 +5,9 @@ Version ACHAT UNIQUEMENT, SANS Daily (H4 seul comme filtre macro), sur 3 paires 
 Validee sur ~981 trades combines (3 actifs, walk-forward), win rate 52-67% selon l'actif et la periode.
 Signal-only : envoie une notification Telegram par paire, ne passe AUCUN ordre.
 
+Donnees via l'API publique MEXC Futures (meme exchange que celui utilise pour executer les trades,
+donc plus besoin de comparer un prix Binance a un prix MEXC au moment d'agir sur un signal).
+
 A executer via GitHub Actions toutes les 15 minutes (ou en local).
 """
 
@@ -18,8 +21,8 @@ import bisect
 # ============================================================
 # CONFIGURATION (identique a la version validee en backtest)
 # ============================================================
-SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
-BASE_URL = "https://fapi.binance.com/fapi/v1/klines"
+SYMBOLS = ["BTC_USDT", "ETH_USDT", "SOL_USDT"]   # notation MEXC (underscore, pas comme Binance)
+BASE_URL = "https://contract.mexc.com/api/v1/contract/kline/"
 
 # Fenetres reduites vs le backtest (pas besoin de 900j d'historique pour verifier l'etat ACTUEL,
 # juste assez de recul pour reconstruire correctement l'etat des zones)
@@ -33,7 +36,7 @@ ATR_LEN = 14
 SL_BUFFER_ATR_MULT = 0.15
 OB_LOOKBACK = 8
 
-BINANCE_INTERVAL = {"Min5": "5m", "Min60": "1h", "Hour4": "4h"}
+MEXC_INTERVAL = {"Min5": "Min5", "Min60": "Min60", "Hour4": "Hour4"}   # MEXC utilise deja ces noms
 INTERVAL_SECONDS = {"Min5": 300, "Min60": 3600, "Hour4": 14400}
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
@@ -41,23 +44,28 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 
 # ============================================================
-# RECUPERATION DES DONNEES (Binance Futures)
+# RECUPERATION DES DONNEES (MEXC Futures)
 # ============================================================
-def fetch_klines_batch(symbol, interval, start_ms, end_ms, limit=1500):
-    binance_interval = BINANCE_INTERVAL[interval]
-    url = f"{BASE_URL}?symbol={symbol}&interval={binance_interval}&startTime={start_ms}&endTime={end_ms}&limit={limit}"
+def fetch_klines_batch(symbol, interval, start=None, end=None):
+    mexc_interval = MEXC_INTERVAL[interval]
+    url = f"{BASE_URL}{symbol}?interval={mexc_interval}"
+    if start is not None:
+        url += f"&start={start}"
+    if end is not None:
+        url += f"&end={end}"
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
     with urllib.request.urlopen(req, timeout=15) as resp:
         raw = json.loads(resp.read().decode())
-    if isinstance(raw, dict) and raw.get("code"):
-        raise RuntimeError(f"Erreur API Binance : {raw}")
+    if not raw.get("success"):
+        raise RuntimeError(f"Erreur API MEXC : {raw}")
+    d = raw["data"]
     candles = []
-    for row in raw:
+    for i in range(len(d["time"])):
         candles.append({
-            "ts": row[0] // 1000,
-            "open": float(row[1]), "high": float(row[2]),
-            "low": float(row[3]), "close": float(row[4]),
+            "ts": d["time"][i], "open": float(d["open"][i]), "high": float(d["high"][i]),
+            "low": float(d["low"][i]), "close": float(d["close"][i]),
         })
+    candles.sort(key=lambda c: c["ts"])
     return candles
 
 
@@ -66,21 +74,20 @@ def fetch_klines(symbol, interval, days_back):
     end_ts = int(time.time())
     start_ts = end_ts - days_back * 86400
     all_candles = []
-    cur_start_ms = start_ts * 1000
-    end_ms = end_ts * 1000
+    cur_end = end_ts
     safety_counter = 0
     max_batches = 200
 
-    while cur_start_ms < end_ms and safety_counter < max_batches:
+    while safety_counter < max_batches:
         safety_counter += 1
-        batch = fetch_klines_batch(symbol, interval, cur_start_ms, end_ms, limit=1500)
+        batch = fetch_klines_batch(symbol, interval, start=start_ts, end=cur_end)
         if not batch:
             break
-        all_candles.extend(batch)
-        last_ts = batch[-1]["ts"]
-        cur_start_ms = (last_ts + interval_sec) * 1000
-        if len(batch) < 1500:
+        all_candles = batch + all_candles
+        earliest = batch[0]["ts"]
+        if earliest <= start_ts or len(batch) < 2:
             break
+        cur_end = earliest - interval_sec
         time.sleep(0.15)
 
     seen = {c["ts"]: c for c in all_candles}
@@ -383,4 +390,3 @@ def check_all_symbols():
 
 if __name__ == "__main__":
     check_all_symbols()
-          
