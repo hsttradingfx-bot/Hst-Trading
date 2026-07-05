@@ -34,6 +34,10 @@ ATR_LEN = 14
 SL_BUFFER_ATR_MULT = 0.15
 OB_LOOKBACK = 8
 
+# Message de confirmation TEMPORAIRE a chaque scan (pour verifier que le bot tourne).
+# Mets a False (ou supprime ces 2 lignes + le bloc dans __main__) quand tu es rassure.
+SEND_HEARTBEAT = True
+
 MEXC_INTERVAL = {"Min5": "Min5", "Min60": "Min60", "Hour4": "Hour4"}
 INTERVAL_SECONDS = {"Min5": 300, "Min60": 3600, "Hour4": 14400}
 
@@ -411,4 +415,9 @@ def check_all_symbols():
 
 
 if __name__ == "__main__":
+    # --- Message de confirmation TEMPORAIRE (a enlever une fois rassure) ---
+    # Il confirme, a chaque scan, que le bot tourne bien meme s'il n'y a pas de signal.
+    if SEND_HEARTBEAT:
+        send_telegram_message(f"🔍 BOT 1 : scan lancé à {now_paris_str()} (Paris), je vérifie BTC/ETH/SOL...")
+
     check_all_symbols()
