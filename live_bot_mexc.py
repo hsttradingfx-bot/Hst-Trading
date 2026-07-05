@@ -36,7 +36,7 @@ OB_LOOKBACK = 8
 
 # Message de confirmation TEMPORAIRE a chaque scan (pour verifier que le bot tourne).
 # Mets a False (ou supprime ces 2 lignes + le bloc dans __main__) quand tu es rassure.
-SEND_HEARTBEAT = True
+SEND_HEARTBEAT = False
 
 MEXC_INTERVAL = {"Min5": "Min5", "Min60": "Min60", "Hour4": "Hour4"}
 INTERVAL_SECONDS = {"Min5": 300, "Min60": 3600, "Hour4": 14400}
