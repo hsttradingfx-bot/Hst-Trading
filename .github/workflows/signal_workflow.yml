@@ -1,14 +1,22 @@
 name: Signal SOL Bot
 
-# Ce workflow lance le script de detection de signal toutes les 15 minutes.
-# GitHub Actions est gratuit pour les repos publics (illimite) et donne
-# 2000 minutes/mois gratuites pour les repos prives - largement suffisant
-# pour un script qui tourne quelques secondes toutes les 15 minutes.
+# Ce workflow lance les deux bots de detection de signal toutes les 15 minutes,
+# puis sauvegarde (commit) les fichiers du journal pour que l'etat persiste
+# entre les executions (sinon le suivi des trades perd la memoire a chaque run).
 
 on:
   schedule:
-    - cron: "*/15 * * * *" # toutes les 15 minutes
-  workflow_dispatch: {}    # permet aussi de le lancer manuellement depuis GitHub
+    - cron: "*/15 * * * *"   # toutes les 15 minutes
+  workflow_dispatch: {}       # permet aussi de lancer manuellement depuis GitHub
+
+# Permissions necessaires pour que le workflow puisse committer les fichiers d'etat
+permissions:
+  contents: write
+
+# Empeche deux executions de tourner en meme temps (evite les conflits de commit)
+concurrency:
+  group: signal-bot
+  cancel-in-progress: false
 
 jobs:
   check-signal:
@@ -22,11 +30,23 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Verifier le signal
+      - name: Verifier le signal (bot 1 + bot 2)
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           python live_bot_mexc.py
           python bot2.py
-          
+
+      - name: Sauvegarder l'etat du journal (commit si change)
+        run: |
+          git config user.name "hst-bot"
+          git config user.email "hst-bot@users.noreply.github.com"
+          # On ajoute tous les fichiers d'etat s'ils existent (|| true evite l'echec si absent)
+          git add open_trades.json trades_journal.csv seen_keys.json signaled_state.json 2>/dev/null || true
+          if ! git diff --cached --quiet; then
+            git commit -m "update journal [skip ci]"
+            git push
+          else
+            echo "Aucun changement d'etat, rien a committer."
+          fi
