@@ -42,6 +42,10 @@ import urllib.request
 import urllib.parse
 import bisect
 
+# Module de journal automatique (meme dossier / repo)
+import trade_journal
+import follow_logic
+
 # ============================================================
 # CONFIGURATION
 # ============================================================
@@ -394,18 +398,42 @@ def check_symbol(symbol, state):
     send_telegram(msg)
     print(msg)
 
+    # --- Journal : enregistrer le signal ANTICIPE (en attente d'entree sur l'OB) ---
+    # Comme le bot 2 signale AVANT que le prix touche l'OB, on stocke l'ordre
+    # limite en attente. Le suivi (follow_bot2_pending) verifiera d'abord si le
+    # prix a touche l'OB (entree) avant d'appliquer les paliers.
+    dedup_key = f"bot2:{symbol}:{round(entry, 2)}:{round(tp_final, 2)}"
+    trade_journal.register_signal(
+        bot="bot2", symbol=symbol, direction="long",
+        entry_price=entry, sl=sl, tp_final=tp_final,
+        r_unit=r_unit,
+        extra={"pending_entry": True, "ob_level": entry},
+        dedup_key=dedup_key,
+    )
+
 
 def main():
     state = load_state()
+    m5_by_symbol = {}
     for symbol in SYMBOLS:
         try:
             check_symbol(symbol, state)
         except Exception as e:
             print(f"[{symbol}] Erreur: {e}")
+        # on recupere les M5 recentes pour le suivi des trades ouverts
+        try:
+            m5_by_symbol[symbol] = fetch_klines(symbol, "Min5", LOOKBACK_M5)
+        except Exception as e:
+            print(f"[{symbol}] Erreur fetch M5 pour suivi: {e}")
         time.sleep(0.3)
     save_state(state)
+
+    # --- Journal : suivre les trades bot2 (entree en attente + paliers) ---
+    try:
+        trade_journal.update_open_trades("bot2", m5_by_symbol, follow_logic.follow_bot2_pending)
+    except Exception as e:
+        print(f"Erreur suivi journal bot2 : {e}")
 
 
 if __name__ == "__main__":
     main()
-    
