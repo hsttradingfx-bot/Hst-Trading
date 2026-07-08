@@ -87,8 +87,11 @@ BYBIT_INTERVAL = {"Min5": "5", "Min60": "60", "Hour4": "240"}
 def fetch_klines(symbol, interval, limit):
     bybit_interval = BYBIT_INTERVAL[interval]
     # Construction de l'URL spécifique à Bybit (Linear = Futures)
-    url = f"{BASE_URL}?category=linear&symbol={symbol}&interval={bybit_interval}&limit={limit}"
-    
+            url = f"{BASE_URL}?"
+category=linear&symbol={symbol}
+&interval={bybit_interval}
+&limit={limit}"
+
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
     with urllib.request.urlopen(req, timeout=20) as resp:
         raw = json.loads(resp.read().decode())
