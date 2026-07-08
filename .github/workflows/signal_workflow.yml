@@ -1,13 +1,12 @@
 name: Signal SOL Bot
 
 # Ce workflow lance les deux bots de detection de signal toutes les 15 minutes,
-# puis sauvegarde (commit) les fichiers du journal pour que l'etat persiste
-# entre les executions (sinon le suivi des trades perd la memoire a chaque run).
+# puis sauvegarde (commit) les fichiers du journal pour que l'etat persiste.
 
 on:
   schedule:
-    - cron: "*/15 * * * *"   # toutes les 15 minutes
-  workflow_dispatch: {}       # permet aussi de lancer manuellement depuis GitHub
+    - cron: "*/15 * * * *"  # toutes les 15 minutes
+  workflow_dispatch: {}     # permet aussi de lancer manuellement depuis GitHub
 
 # Permissions necessaires pour que le workflow puisse committer les fichiers d'etat
 permissions:
@@ -38,30 +37,19 @@ jobs:
           python live_bot_mexc.py
           python bot2.py
 
-      - name: Sauvegarder l'etat du journal (commit si change)
+      - name: Sauvegarder le journal et l'etat (Commit & Push)
         run: |
-          git config user.name "hst-bot"
-          git config user.email "hst-bot@users.noreply.github.com"
-          # On ajoute tous les fichiers d'etat s'ils existent (|| true evite l'echec si absent)
-          git add open_trades.json trades_journal.csv seen_keys.json signaled_state.json 2>/dev/null || true
+          git config --global user.name "GitHub Actions Bot"
+          git config --global user.email "actions@github.com"
+          
+          # On ajoute TOUS les fichiers d'etat et de journal s'ils existent
+          git add open_trades.json trades_journal.csv seen_keys.json signaled_state.json || true
+          
+          # Verifie s'il y a des changements avant de commit pour eviter une erreur inutile
           if ! git diff --cached --quiet; then
-            git commit -m "update journal [skip ci]"
+            git commit -m "Mise a jour automatique du journal et des etats [skip ci]"
             git push
           else
             echo "Aucun changement d'etat, rien a committer."
           fi
-    - name: Sauvegarder le journal des trades (Commit & Push)
-      run: |
-        git config --global user.name "GitHub Actions Bot"
-        git config --global user.email "actions@github.com"
-        
-        # Ajoute les fichiers créés ou modifiés par le journal
-        git add open_trades.json trades_journal.csv seen_keys.json || true
-        
-        # Vérifie s'il y a des changements avant de commit pour éviter une erreur inutile
-        if ! git diff --cached --quiet; then
-          git commit -m "Mise à jour automatique du journal des trades [skip ci]"
-          git push
-        else
-          echo "Aucune modification à sauvegarder dans le journal."
-        fi
+          
