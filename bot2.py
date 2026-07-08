@@ -84,22 +84,30 @@ BYBIT_INTERVAL = {"Min5": "5", "Min60": "60", "Hour4": "240"}
 
 
 # ============================================================
-# RECUPERATION DES DONNEES (Binance Futures, urllib pur)
-# ============================================================
-def fetch_klines(symbol, interval, limit):
-    binance_interval = BINANCE_INTERVAL[interval]
-    url = f"{BASE_URL}?symbol={symbol}&interval={binance_interval}&limit={limit}"
+# def fetch_klines(symbol, interval, limit):
+    bybit_interval = BYBIT_INTERVAL[interval]
+    # Construction de l'URL spécifique à Bybit (Linear = Futures)
+    url = f"{BASE_URL}?category=linear&symbol={symbol}&interval={bybit_interval}&limit={limit}"
+    
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
     with urllib.request.urlopen(req, timeout=20) as resp:
         raw = json.loads(resp.read().decode())
-    if isinstance(raw, dict) and raw.get("code"):
-        raise RuntimeError(f"Erreur API Binance {symbol} {interval}: {raw}")
+        
+    if raw.get("retCode") != 0:
+        raise RuntimeError(f"Erreur API Bybit {symbol} {interval}: {raw.get('retMsg')}")
+        
+    # Extraction et formatage des bougies version Bybit
+    raw_candles = raw.get("result", {}).get("list", [])
     candles = []
-    for row in raw:
+    
+    # Bybit renvoie les données de la plus récente à la plus ancienne, on doit inverser la liste
+    for row in reversed(raw_candles):
         candles.append({
-            "ts": row[0] // 1000,
-            "open": float(row[1]), "high": float(row[2]),
-            "low": float(row[3]), "close": float(row[4]),
+            "ts": int(row[0]) // 1000,
+            "open": float(row[1]), 
+            "high": float(row[2]),
+            "low": float(row[3]), 
+            "close": float(row[4]),
         })
     return candles
 
