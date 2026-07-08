@@ -50,7 +50,7 @@ import follow_logic
 # CONFIGURATION
 # ============================================================
 SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
-BASE_URL = https://api.bybit.com/v5/market/kline
+BASE_URL = "https://api.bybit.com/v5/market/kline"
 
 # On ne recupere que ce qu'il faut pour evaluer l'etat courant (pas 400 jours)
 LOOKBACK_H4 = 400     # bougies H4 (~66 jours)
@@ -78,7 +78,9 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "signaled_state.json")
 
-BINANCE_INTERVAL = {"Min5": "5m", "Min60": "1h", "Hour4": "4h"}
+# Remplace l'ancien dictionnaire par celui-ci :
+BYBIT_INTERVAL = {"Min5": "5", "Min60": "60", "Hour4": "240"}
+
 
 
 # ============================================================
