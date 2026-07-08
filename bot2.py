@@ -50,7 +50,7 @@ import follow_logic
 # CONFIGURATION
 # ============================================================
 SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
-BASE_URL = "https://fapi.binance.com/fapi/v1/klines"
+BASE_URL = https://api.bybit.com/v5/market/kline
 
 # On ne recupere que ce qu'il faut pour evaluer l'etat courant (pas 400 jours)
 LOOKBACK_H4 = 400     # bougies H4 (~66 jours)
