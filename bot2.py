@@ -86,21 +86,18 @@ BYBIT_INTERVAL = {"Min5": "5", "Min60": "60", "Hour4": "240"}
 # ============================================================
 def fetch_klines(symbol, interval, limit):
     bybit_interval = BYBIT_INTERVAL[interval]
-    # Construction de l'URL spécifique à Bybit (Linear = Futures)
-            url = f"{BASE_URL}?"
-category=linear&symbol={symbol}
-&interval={bybit_interval}
-&limit={limit}"
-
+    url = f"{BASE_URL}?category=linear&symbol={symbol}&interval={bybit_interval}&limit={limit}"
+    
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
     with urllib.request.urlopen(req, timeout=20) as resp:
         raw = json.loads(resp.read().decode())
-
-    # Extraction et formatage des bougies version Bybit
+        
+    if raw.get("retCode") != 0:
+        raise RuntimeError(f"Erreur API Bybit {symbol} {interval}: {raw.get('retMsg')}")
+        
     raw_candles = raw.get("result", {}).get("list", [])
     candles = []
     
-    # Bybit renvoie les données de la plus récente à la plus ancienne, on doit inverser la liste
     for row in reversed(raw_candles):
         candles.append({
             "ts": int(row[0]) // 1000,
