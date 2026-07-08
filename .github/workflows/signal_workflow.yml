@@ -50,3 +50,18 @@ jobs:
           else
             echo "Aucun changement d'etat, rien a committer."
           fi
+    - name: Sauvegarder le journal des trades (Commit & Push)
+      run: |
+        git config --global user.name "GitHub Actions Bot"
+        git config --global user.email "actions@github.com"
+        
+        # Ajoute les fichiers créés ou modifiés par le journal
+        git add open_trades.json trades_journal.csv seen_keys.json || true
+        
+        # Vérifie s'il y a des changements avant de commit pour éviter une erreur inutile
+        if ! git diff --cached --quiet; then
+          git commit -m "Mise à jour automatique du journal des trades [skip ci]"
+          git push
+        else
+          echo "Aucune modification à sauvegarder dans le journal."
+        fi
