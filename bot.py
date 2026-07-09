@@ -24,11 +24,12 @@ RR_MIN = 2.0
 # SOL ne montre pas de différence significative -> pas de restriction pour SOL.
 # (échantillon limité, à réévaluer si le comportement live diverge)
 PLAGES_ACTIVES = {
-    "BTCUSDT": (9, 22),
-    "ETHUSDT": (9, 22),
-    "BNBUSDT": (9, 22),
-    "SOLUSDT": (9, 22),   # pas de restriction
+    "BTCUSDT": [(9, 12), (14, 16)],
+    "ETHUSDT": [(9, 12), (14, 16)],
+    "BNBUSDT": [(14, 16)],  # Exclu le matin, actif l'après-midi
+    "SOLUSDT": [(14, 16)]   # Exclu le matin, actif l'après-midi
 }
+
 
 STATE_FILE = "state.json"
 STATE_MAX_AGE_JOURS = 5           # purge des vieilles clés d'état
