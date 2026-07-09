@@ -1,4 +1,5 @@
+python-3.11.x
 pandas
 numpy
 requests
-python-telegram-bot
+
