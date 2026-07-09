@@ -1,16 +1,24 @@
 import pandas as pd
 import numpy as np
-import json, time, os, urllib.request, urllib.parse
+import json, time, os, hmac, hashlib, urllib.request, urllib.parse
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 PARIS = ZoneInfo("Europe/Paris")
-BINANCE_URL = "https://fapi.binance.com/fapi/v1/klines"
+BYBIT_URL = "https://api.bybit.eu/v5/market/kline"
+
+# Bybit utilise des codes d'intervalle différents de Binance
+BYBIT_INTERVALS = {
+    "4h": "240",
+    "1h": "60",
+    "5m": "5",
+    "1m": "1",
+}
 
 # =========================================================
 # CONFIG
 # =========================================================
-ACTIFS = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT"]
+ACTIFS = ["BTCUSDC", "ETHUSDC", "BNBUSDC", "SOLUSDC"]
 JOURS_H4 = 90     # historique nécessaire pour resynchroniser le détecteur H4
 JOURS_H1 = 45
 JOURS_M5 = 8
@@ -19,25 +27,44 @@ MAX_ATTENTE_MINUTES = 1440       # délai max entre point H1 et confirmation M5
 MAX_AGE_SIGNAL_MINUTES = 240     # on ignore les setups M5 trop vieux (> 4h)
 RR_MIN = 2.0
 
-# Plage horaire active PAR ACTIF (heure de Paris).
-# Basé sur l'analyse du backtest : BTC/ETH/BNB montrent un meilleur WR sur 9h-22h,
-# SOL ne montre pas de différence significative -> pas de restriction pour SOL.
-# (échantillon limité, à réévaluer si le comportement live diverge)
+# Plage(s) horaire(s) active(s) PAR ACTIF (heure de Paris).
+# Chaque actif a une LISTE de plages (debut, fin) - une ou plusieurs.
 PLAGES_ACTIVES = {
-    "BTCUSDT": [(9, 12), (14, 16)],
-    "ETHUSDT": [(9, 12), (14, 16)],
-    "BNBUSDT": [(14, 16)],  # Exclu le matin, actif l'après-midi
-    "SOLUSDT": [(14, 16)]   # Exclu le matin, actif l'après-midi
+    "BTCUSDC": [(9, 12), (14, 16)],
+    "ETHUSDC": [(9, 12), (14, 16)],
+    "BNBUSDC": [(14, 16)],  # Exclu le matin, actif l'après-midi
+    "SOLUSDC": [(14, 16)]   # Exclu le matin, actif l'après-midi
 }
 
 
-STATE_FILE = "state.json"
+STATE_FILE = os.path.join(os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "."), "state.json")
 STATE_MAX_AGE_JOURS = 5           # purge des vieilles clés d'état
 
 LOG_VERBOSE = True                # passe à False pour des logs plus courts
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+
+# =========================================================
+# EXÉCUTION VIA GAINIUM (webhooks) — plus d'accès direct à l'API Bybit
+# =========================================================
+GAINIUM_WEBHOOK_URL = "https://api.gainium.io/trade_signal"
+EXECUTION_REELLE = True
+
+# Un bot Gainium = une direction fixe (Long ou Short) pour un actif donné.
+# On a donc 2 bots par actif : haussier -> bot Long, baissier -> bot Short.
+BOT_IDS = {
+    "BTCUSDC": {"haussier": "6a500c50ebbae511728a486b", "baissier": "6a5011baebbae5117291ec93"},
+    "ETHUSDC": {"haussier": "6a500ea2ebbae511728d9589", "baissier": "6a501190ebbae5117291b4a3"},
+    "SOLUSDC": {"haussier": "6a500fa2ebbae511728ef791", "baissier": "6a501512ebbae5117296aa9b"},
+    "BNBUSDC": {"haussier": "6a5010f4ebbae5117290da6f", "baissier": "6a5015e6ebbae5117297d951"},
+}
+
+RISQUE_PAR_PLAGE = {
+    (9, 12): 0.02,
+    (14, 16): 0.05,
+}
+RISQUE_PAR_DEFAUT = 0.02
 
 
 def log_rejet(symbol, sens, ts_conf, raison, **details):
@@ -49,7 +76,7 @@ def log_rejet(symbol, sens, ts_conf, raison, **details):
 
 
 # =========================================================
-# STRUCTURE DE DONNÉES CANDLE + DÉTECTEUR (identique à ton code)
+# STRUCTURE DE DONNÉES CANDLE + DÉTECTEUR
 # =========================================================
 class Candle:
     def __init__(self, ts, o, h, l, c):
@@ -208,37 +235,54 @@ class Det:
 
 
 # =========================================================
-# FETCH BINANCE
+# FETCH BYBIT
 # =========================================================
 def fetch(symbol, interval, days):
+    """
+    Récupère des bougies depuis Bybit EU (category=spot, cohérent avec l'exécution des ordres).
+    `interval` reste au format Binance ("4h", "1h", "5m", "1m") pour ne pas
+    changer le reste du code — la conversion vers le code Bybit se fait ici.
+    """
+    interval_code = BYBIT_INTERVALS[interval]
     end_ts = int(time.time() * 1000)
     start_ts = end_ts - days * 86400000
-    all_c = []
-    cur = start_ts
+    lignes = {}  # dédoublonnage par timestamp
+    cur_end = end_ts
     attempts = 0
-    while cur < end_ts:
-        url = f"{BINANCE_URL}?symbol={symbol}&interval={interval}&startTime={cur}&endTime={end_ts}&limit=1000"
+
+    while cur_end > start_ts:
+        url = f"{BYBIT_URL}?category=spot&symbol={symbol}&interval={interval_code}&end={cur_end}&limit=1000"
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
         try:
             with urllib.request.urlopen(req, timeout=15) as r:
                 data = json.loads(r.read().decode())
-            if not data:
+            if data.get("retCode") != 0:
+                raise Exception(data.get("retMsg", "erreur Bybit"))
+            rows = data.get("result", {}).get("list", [])
+            if not rows:
                 break
-            for k in data:
-                all_c.append(Candle(k[0], float(k[1]), float(k[2]), float(k[3]), float(k[4])))
-            last = data[-1][0]
-            if last <= cur:
+            for row in rows:
+                ts = int(row[0])
+                lignes[ts] = row
+            oldest_ts = min(int(row[0]) for row in rows)
+            if oldest_ts <= start_ts or oldest_ts >= cur_end:
                 break
-            cur = last + 1
+            cur_end = oldest_ts - 1
             attempts = 0
-            time.sleep(0.1)
+            time.sleep(0.15)
         except Exception:
             attempts += 1
             if attempts > 3:
                 break
             time.sleep(1.5)
             continue
-    return all_c
+
+    ts_valides = sorted(ts for ts in lignes if start_ts <= ts <= end_ts)
+    candles = []
+    for ts in ts_valides:
+        row = lignes[ts]
+        candles.append(Candle(ts, float(row[1]), float(row[2]), float(row[3]), float(row[4])))
+    return candles
 
 
 def construire_timeline_sens(candles, historique):
@@ -279,14 +323,100 @@ def charger_state():
 def sauver_state(state):
     now_ms = int(time.time() * 1000)
     max_age_ms = STATE_MAX_AGE_JOURS * 86400000
-    state_purge = {k: v for k, v in state.items() if now_ms - v <= max_age_ms}
+    state_purge = {}
+    for k, v in state.items():
+        if k == "_positions_ouvertes":
+            state_purge[k] = v  # structure différente, pas de purge par timestamp
+        elif now_ms - v <= max_age_ms:
+            state_purge[k] = v
     with open(STATE_FILE, "w") as f:
         json.dump(state_purge, f)
 
 
 # =========================================================
-# TELEGRAM
+# WEBHOOKS GAINIUM (exécution des trades)
 # =========================================================
+def envoyer_webhook_gainium(action, bot_uuid):
+    payload = json.dumps({"action": action, "uuid": bot_uuid}).encode()
+    req = urllib.request.Request(GAINIUM_WEBHOOK_URL, data=payload, headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            reponse = r.read().decode()
+            return {"succes": True, "reponse": reponse}
+    except Exception as e:
+        return {"succes": False, "erreur": str(e)}
+
+
+def ouvrir_position_gainium(symbol, sens):
+    bot_uuid = BOT_IDS.get(symbol, {}).get(sens)
+    if not bot_uuid:
+        return {"succes": False, "erreur": f"aucun bot Gainium configuré pour {symbol}/{sens}"}
+    return envoyer_webhook_gainium("startDeal", bot_uuid)
+
+
+def fermer_position_gainium(symbol, sens):
+    bot_uuid = BOT_IDS.get(symbol, {}).get(sens)
+    if not bot_uuid:
+        return {"succes": False, "erreur": f"aucun bot Gainium configuré pour {symbol}/{sens}"}
+    return envoyer_webhook_gainium("closeDeal", bot_uuid)
+
+
+def surveiller_positions_ouvertes(state, candles_par_symbole):
+    """
+    Vérifie les positions ouvertes (suivies dans state) contre les dernières bougies
+    récupérées, et déclenche la clôture via webhook si le SL ou le TP est touché.
+    Pas d'accès direct à Bybit ici : on se base uniquement sur les prix publics déjà
+    récupérés pour la détection.
+    """
+    positions = state.get("_positions_ouvertes", {})
+    a_supprimer = []
+
+    for cle, pos in positions.items():
+        symbol = pos["symbol"]
+        candles_m5 = candles_par_symbole.get(symbol)
+        if not candles_m5:
+            continue
+
+        touche = None
+        for c in candles_m5:
+            if c.ts <= pos["ts_ouverture"]:
+                continue
+            if pos["sens"] == "haussier":
+                if c.low <= pos["sl"]:
+                    touche = "SL"
+                    break
+                if c.high >= pos["tp"]:
+                    touche = "TP"
+                    break
+            else:
+                if c.high >= pos["sl"]:
+                    touche = "SL"
+                    break
+                if c.low <= pos["tp"]:
+                    touche = "TP"
+                    break
+
+        if touche:
+            resultat = fermer_position_gainium(symbol, pos["sens"])
+            emoji = "🔴" if touche == "SL" else "🟢"
+            if resultat["succes"]:
+                envoyer_telegram(f"{emoji} {symbol} [{pos['sens']}] : {touche} touché, clôture envoyée à Gainium.")
+            else:
+                envoyer_telegram(f"⚠️ {symbol} [{pos['sens']}] : {touche} touché mais échec de clôture Gainium ({resultat['erreur']}) — vérifie manuellement.")
+            a_supprimer.append(cle)
+
+    for cle in a_supprimer:
+        del positions[cle]
+    state["_positions_ouvertes"] = positions
+
+
+def obtenir_risque_pct(symbol, h_paris):
+    for debut, fin in PLAGES_ACTIVES.get(symbol, []):
+        if debut <= h_paris < fin:
+            return RISQUE_PAR_PLAGE.get((debut, fin), RISQUE_PAR_DEFAUT)
+    return None
+
+
 def envoyer_telegram(message):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print("⚠️ TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID manquants, message non envoyé :")
@@ -331,7 +461,6 @@ def detecter_signaux(symbol, candles_h4, candles_h1, candles_m5, state):
                 continue
             ts_val_conf = candles_m5[p_conf['b_idx']].ts
 
-            # signal M5 trop vieux -> on ignore (plus d'intérêt à alerter)
             if (now_ms - ts_val_conf) / 60000.0 > MAX_AGE_SIGNAL_MINUTES:
                 log_rejet(symbol, p_h1['sens'], ts_val_conf, "trop vieux (> MAX_AGE_SIGNAL_MINUTES)")
                 continue
@@ -364,7 +493,6 @@ def detecter_signaux(symbol, candles_h4, candles_h1, candles_m5, state):
                 log_rejet(symbol, p_h1['sens'], ts_val_conf, "RR insuffisant", rr=round(rr_theorique, 2))
                 continue
 
-            # le setup est-il encore valide (SL/TP pas déjà touchés depuis la formation) ?
             statut = None
             ajustement = prix_entree * 0.0001
             for m in range(p_conf['b_idx'] + 1, len(candles_m5)):
@@ -395,12 +523,12 @@ def detecter_signaux(symbol, candles_h4, candles_h1, candles_m5, state):
                         break
             if statut == "EXPIRE":
                 log_rejet(symbol, p_h1['sens'], ts_val_conf, "SL ou TP déjà touché depuis la formation (signal caduc)")
-                continue  # SL ou TP déjà touché -> signal caduc, on n'alerte pas
+                continue
 
             cle = f"{symbol}_{p_h1['b_idx']}_{p_conf['b_idx']}"
             if cle in state:
                 log_rejet(symbol, p_h1['sens'], ts_val_conf, "déjà alerté (présent dans state.json)")
-                continue  # déjà alerté
+                continue
 
             state[cle] = now_ms
             nouveaux_signaux.append({
@@ -418,11 +546,11 @@ def detecter_signaux(symbol, candles_h4, candles_h1, candles_m5, state):
     return nouveaux_signaux
 
 
-def formater_message(sig):
+def formater_message(sig, execution=None):
     emoji = "🟢" if sig["sens"] == "haussier" else "🔴"
     direction = "LONG" if sig["sens"] == "haussier" else "SHORT"
     date_str = datetime.fromtimestamp(sig["ts_m5"] / 1000.0, tz=timezone.utc).astimezone(PARIS).strftime('%Y-%m-%d %H:%M')
-    return (
+    base = (
         f"{emoji} <b>{sig['symbol']} - {direction}</b>\n"
         f"Type: {sig['type_entree']}\n"
         f"Entrée: {sig['prix_entree']:.4f}\n"
@@ -431,42 +559,75 @@ def formater_message(sig):
         f"R:R ≈ 1:{sig['rr']}\n"
         f"Détecté: {date_str} (Paris)"
     )
+    if execution is None:
+        return base
+    if execution.get("ordre_place"):
+        risque_txt = f" (tranche à {execution['risque_pct']*100:.0f}% de risque visé)" if execution.get("risque_pct") else ""
+        base += f"\n\n✅ <b>DEAL OUVERT SUR GAINIUM</b>{risque_txt}"
+    else:
+        base += f"\n\n⛔ <b>NON EXÉCUTÉ</b> — {execution.get('raison', 'raison inconnue')}"
+    return base
 
 
 # =========================================================
 # MAIN
 # =========================================================
 def dans_plage_active(symbol):
-    debut, fin = PLAGES_ACTIVES.get(symbol, (0, 24))
+    plages = PLAGES_ACTIVES.get(symbol, [(0, 24)])
     h_paris = datetime.now(timezone.utc).astimezone(PARIS).hour
-    if debut <= fin:
-        return debut <= h_paris < fin
-    else:
-        # plage qui traverse minuit
-        return h_paris >= debut or h_paris < fin
+    for debut, fin in plages:
+        if debut <= fin:
+            if debut <= h_paris < fin:
+                return True
+        else:
+            if h_paris >= debut or h_paris < fin:
+                return True
+    return False
 
 
 def main():
     state = charger_state()
     tous_les_signaux = []
+    candles_par_symbole = {}  # pour surveiller les positions ouvertes après coup
     h_paris = datetime.now(timezone.utc).astimezone(PARIS).hour
 
     for actif in ACTIFS:
         if not dans_plage_active(actif):
-            debut, fin = PLAGES_ACTIVES.get(actif, (0, 24))
-            print(f"⏸️ {actif} hors plage active ({debut}h-{fin}h Paris, il est {h_paris}h) — skip.")
+            plages = PLAGES_ACTIVES.get(actif, [(0, 24)])
+            print(f"⏸️ {actif} hors plage active ({plages} Paris, il est {h_paris}h) — skip.")
             continue
         print(f"[🔎] Analyse {actif}...")
         c_h4 = fetch(actif, "4h", JOURS_H4)
         c_h1 = fetch(actif, "1h", JOURS_H1)
         c_m5 = fetch(actif, "5m", JOURS_M5)
+        candles_par_symbole[actif] = c_m5
         signaux = detecter_signaux(actif, c_h4, c_h1, c_m5, state)
         tous_les_signaux.extend(signaux)
-        time.sleep(0.5)  # marge de sécurité anti rate-limit entre chaque actif
+        time.sleep(0.5)
+
+    if EXECUTION_REELLE:
+        surveiller_positions_ouvertes(state, candles_par_symbole)
 
     if tous_les_signaux:
         for sig in tous_les_signaux:
-            msg = formater_message(sig)
+            execution = None
+            if EXECUTION_REELLE:
+                risque_pct = obtenir_risque_pct(sig["symbol"], h_paris)
+                resultat = ouvrir_position_gainium(sig["symbol"], sig["sens"])
+                if resultat["succes"]:
+                    execution = {"ordre_place": True, "risque_pct": risque_pct}
+                    positions = state.setdefault("_positions_ouvertes", {})
+                    positions[f"{sig['symbol']}_{sig['sens']}_{sig['ts_m5']}"] = {
+                        "symbol": sig["symbol"],
+                        "sens": sig["sens"],
+                        "sl": sig["sl"],
+                        "tp": sig["tp"],
+                        "ts_ouverture": sig["ts_m5"],
+                    }
+                else:
+                    execution = {"ordre_place": False, "raison": f"échec webhook Gainium: {resultat['erreur']}"}
+
+            msg = formater_message(sig, execution)
             print(msg)
             envoyer_telegram(msg)
     else:
@@ -476,11 +637,4 @@ def main():
 
 
 if __name__ == "__main__":
-    INTERVALLE_SECONDES = 15 * 60  # 15 minutes, comme le cron GitHub Actions
-    while True:
-        try:
-            main()
-        except Exception as e:
-            print(f"Erreur pendant le run: {e}")
-        print(f"Attente {INTERVALLE_SECONDES // 60} minutes avant le prochain run...")
-        time.sleep(INTERVALLE_SECONDES)
+    main()
