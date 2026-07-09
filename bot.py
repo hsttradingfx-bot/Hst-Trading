@@ -27,7 +27,7 @@ PLAGES_ACTIVES = {
     "BTCUSDT": (9, 22),
     "ETHUSDT": (9, 22),
     "BNBUSDT": (9, 22),
-    "SOLUSDT": (0, 24),   # pas de restriction
+    "SOLUSDT": (9, 22),   # pas de restriction
 }
 
 STATE_FILE = "state.json"
