@@ -475,4 +475,11 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    INTERVALLE_SECONDES = 15 * 60  # 15 minutes, comme le cron GitHub Actions
+    while True:
+        try:
+            main()
+        except Exception as e:
+            print(f"Erreur pendant le run: {e}")
+        print(f"Attente {INTERVALLE_SECONDES // 60} minutes avant le prochain run...")
+        time.sleep(INTERVALLE_SECONDES)
