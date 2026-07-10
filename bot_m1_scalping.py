@@ -28,6 +28,10 @@ PLAGES_ACTIVES = {}
 STATE_FILE = os.path.join(os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "."), "state_m1.json")
 STATE_MAX_AGE_JOURS = 2           # les positions M1 se résolvent vite, purge plus rapide
 
+LOCK_FILE = os.path.join(os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "."), "bot_m1.lock")
+INTERVALLE_ATTENTE_RAPIDE_SEC = 60   # fréquence de revérification pendant une fenêtre de confirmation active
+DUREE_MAX_BOUCLE_SEC = 200 * 60      # garde-fou absolu (un peu au-dessus de MAX_ATTENTE_MINUTES)
+
 LOG_VERBOSE = False               # False par défaut ici : trop de comparaisons H1×M1 sur plusieurs jours,
                                    # passe à True seulement si tu dois débugger un run précis
 
@@ -49,7 +53,49 @@ BOT_IDS = {
 }
 
 
-def log_rejet(symbol, sens, ts_conf, raison, **details):
+def acquerir_verrou():
+    """Empêche deux exécutions simultanées (le cron externe pourrait se déclencher
+    pendant que la boucle rapide interne tourne encore)."""
+    if os.path.exists(LOCK_FILE):
+        try:
+            with open(LOCK_FILE, "r") as f:
+                ancien_pid = int(f.read().strip())
+            os.kill(ancien_pid, 0)  # ne tue rien, vérifie juste si le processus existe encore
+            print(f"⏸️ Une autre exécution (PID {ancien_pid}) tourne déjà — on quitte proprement.")
+            return False
+        except (ValueError, ProcessLookupError, OSError):
+            pass  # le verrou est périmé (processus mort), on l'ignore et on le remplace
+    with open(LOCK_FILE, "w") as f:
+        f.write(str(os.getpid()))
+    return True
+
+
+def liberer_verrou():
+    try:
+        if os.path.exists(LOCK_FILE):
+            os.remove(LOCK_FILE)
+    except Exception:
+        pass
+
+
+def detecter_biais_h1_en_attente(candles_h1):
+    """Retourne l'horodatage limite (deadline) au-delà duquel il n'est plus utile
+    d'attendre une confirmation M1 pour ce symbole, ou None si rien de récent."""
+    d_h1 = Det(); d_h1.update(candles_h1)
+    now_ms = int(time.time() * 1000)
+    deadline_la_plus_tardive = None
+    for p_h1 in d_h1.historique:
+        if p_h1['etat'] != 'EPA':
+            continue
+        ts_val_h1 = candles_h1[p_h1['b_idx']].ts
+        deadline = ts_val_h1 + MAX_ATTENTE_MINUTES * 60000
+        if now_ms < deadline:
+            if deadline_la_plus_tardive is None or deadline > deadline_la_plus_tardive:
+                deadline_la_plus_tardive = deadline
+    return deadline_la_plus_tardive
+
+
+
     if not LOG_VERBOSE:
         return
     date_str = datetime.fromtimestamp(ts_conf / 1000.0, tz=timezone.utc).astimezone(PARIS).strftime('%Y-%m-%d %H:%M')
@@ -497,17 +543,15 @@ def formater_message(sig, execution=None):
 # =========================================================
 # MAIN
 # =========================================================
-def main():
-    state = charger_state()
+def executer_scan(candles_h1_cache, state):
+    """Un passage complet : fetch M1 (H1 réutilisé depuis le cache), détection, exécution."""
     tous_les_signaux = []
     candles_par_symbole = {}
 
     for actif in ACTIFS:
         if not dans_plage_active(actif):
-            print(f"⏸️ {actif} hors plage active — skip.")
             continue
-        print(f"[🔎] Analyse M1 {actif}...")
-        c_h1 = fetch(actif, "1h", JOURS_H1)
+        c_h1 = candles_h1_cache[actif]
         c_m1 = fetch(actif, "1m", JOURS_M1)
         candles_par_symbole[actif] = c_m1
         signaux = detecter_signaux(actif, c_h1, c_m1, state)
@@ -541,7 +585,53 @@ def main():
     else:
         print("Aucun nouveau signal M1 ce run.")
 
-    sauver_state(state)
+    return candles_h1_cache
+
+
+def main():
+    if not acquerir_verrou():
+        return
+
+    try:
+        state = charger_state()
+
+        # 1er passage : fetch H1 (une fois) + M1, détection normale
+        candles_h1_cache = {}
+        for actif in ACTIFS:
+            if dans_plage_active(actif):
+                candles_h1_cache[actif] = fetch(actif, "1h", JOURS_H1)
+        executer_scan(candles_h1_cache, state)
+        sauver_state(state)
+
+        # Vérifie s'il faut passer en mode "boucle rapide" (biais H1 récent en attente de confirmation)
+        debut_boucle = time.time()
+        while True:
+            deadlines = []
+            for actif, c_h1 in candles_h1_cache.items():
+                deadline = detecter_biais_h1_en_attente(c_h1)
+                if deadline:
+                    deadlines.append(deadline)
+
+            if not deadlines:
+                break  # aucun biais récent en attente -> on repasse la main au cron normal (5 min)
+
+            if time.time() - debut_boucle > DUREE_MAX_BOUCLE_SEC:
+                print("⏱️ Garde-fou : boucle rapide interrompue après durée maximale.")
+                break
+
+            plus_proche_deadline = min(deadlines) / 1000.0
+            if time.time() >= plus_proche_deadline:
+                break  # la fenêtre d'attente est passée, rien de plus à surveiller rapidement
+
+            print(f"⚡ Biais H1 récent en attente de confirmation M1 — vérification rapide (toutes les {INTERVALLE_ATTENTE_RAPIDE_SEC}s)...")
+            time.sleep(INTERVALLE_ATTENTE_RAPIDE_SEC)
+
+            state = charger_state()
+            executer_scan(candles_h1_cache, state)
+            sauver_state(state)
+
+    finally:
+        liberer_verrou()
 
 
 if __name__ == "__main__":
