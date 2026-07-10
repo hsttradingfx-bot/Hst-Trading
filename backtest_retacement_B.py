@@ -6,9 +6,9 @@ PARIS = ZoneInfo("Europe/Paris")
 BINANCE_URL = "https://fapi.binance.com/fapi/v1/klines"
 
 ACTIFS = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT"]
-JOURS_H4 = 700
-JOURS_H1 = 700
-JOURS_M5 = 700
+JOURS_H4 = 2500   # maximum raisonnable (BTC/ETH listés sur Binance Futures depuis fin 2019/2020)
+JOURS_H1 = 2500
+JOURS_M5 = 2500
 
 # Fenêtre de recherche du point H1 inverse après la formation du B en H4
 MAX_ATTENTE_H1_JOURS = 7
@@ -348,10 +348,15 @@ def afficher_resultats(symbol, trades, points_h4, sans_h1, sans_m5):
     print(f"R:R moyen théorique  : {rr_moyen}")
 
     print(f"\nDétail des trades :")
+    jours_semaine = ["Lundi", "Mardi", "Mercredi", "Jeudi", "Vendredi", "Samedi", "Dimanche"]
     for t in trades:
-        date_str = datetime.fromtimestamp(t["ts_entree"] / 1000.0, tz=timezone.utc).astimezone(PARIS).strftime('%Y-%m-%d %H:%M')
+        dt_paris = datetime.fromtimestamp(t["ts_entree"] / 1000.0, tz=timezone.utc).astimezone(PARIS)
+        date_str = dt_paris.strftime('%Y-%m-%d %H:%M')
+        jour_str = jours_semaine[dt_paris.weekday()]
+        dt_b4 = datetime.fromtimestamp(t["ts_b4"] / 1000.0, tz=timezone.utc).astimezone(PARIS)
+        delai_h4_entree_h = round((t["ts_entree"] - t["ts_b4"]) / 3600000.0, 1)
         emoji = "✅" if t["statut"] == "TP" else ("❌" if t["statut"] == "SL" else "⏱️")
-        print(f"  {date_str} | H4={t['sens_h4_origine']:<8} -> trade {t['sens_trade']:<8} | R:R 1:{t['rr']:<5} | {emoji} {t['statut']}")
+        print(f"  {date_str} ({jour_str:<9}) | B H4 formé le {dt_b4.strftime('%Y-%m-%d %H:%M')} (+{delai_h4_entree_h}h) | H4={t['sens_h4_origine']:<8} -> trade {t['sens_trade']:<8} | R:R 1:{t['rr']:<5} | {emoji} {t['statut']}")
 
 
 # =========================================================
@@ -381,5 +386,34 @@ if __name__ == "__main__":
         print(f"Trades totaux : {len(tous_les_trades)}")
         print(f"Win rate      : {wr}%")
         print(f"R:R moyen     : {rr_moyen}")
+
+        # Ventilation par jour de la semaine
+        jours_semaine = ["Lundi", "Mardi", "Mercredi", "Jeudi", "Vendredi", "Samedi", "Dimanche"]
+        par_jour = {j: {"n": 0, "tp": 0} for j in jours_semaine}
+        par_heure = {}
+        for t in tous_les_trades:
+            dt_paris = datetime.fromtimestamp(t["ts_entree"] / 1000.0, tz=timezone.utc).astimezone(PARIS)
+            j = jours_semaine[dt_paris.weekday()]
+            par_jour[j]["n"] += 1
+            if t["statut"] == "TP":
+                par_jour[j]["tp"] += 1
+            h = dt_paris.hour
+            par_heure.setdefault(h, {"n": 0, "tp": 0})
+            par_heure[h]["n"] += 1
+            if t["statut"] == "TP":
+                par_heure[h]["tp"] += 1
+
+        print(f"\n📅 Ventilation par jour de la semaine (heure d'entrée, Paris) :")
+        for j in jours_semaine:
+            d = par_jour[j]
+            if d["n"] > 0:
+                wr_j = round(d["tp"] / d["n"] * 100, 1)
+                print(f"   {j:<10} : {d['n']} trades | WR {wr_j}%")
+
+        print(f"\n🕐 Ventilation par heure d'entrée (Paris) :")
+        for h in sorted(par_heure.keys()):
+            d = par_heure[h]
+            wr_h = round(d["tp"] / d["n"] * 100, 1)
+            print(f"   {h:02d}h : {d['n']} trades | WR {wr_h}%")
     else:
         print("Aucun trade simulé sur l'ensemble des actifs.")
