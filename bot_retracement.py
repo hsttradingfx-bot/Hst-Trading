@@ -478,4 +478,189 @@ def detecter_signaux(symbol, candles_h1, candles_m1, state):
             continue
         ts_b1 = candles_h1[p_h1['b_idx']].ts
         sens_h1 = p_h1['sens']
-        sens_inverse = 'baissier' if sens_h1 == 'haussier' 
+        sens_inverse = 'baissier' if sens_h1 == 'haussier' else 'haussier'
+        B1 = p_h1['B']
+
+        for p_m1 in d_m1.historique:
+            if EXIGER_EPA_SUR_M1_INVERSE and p_m1['etat'] != 'EPA':
+                continue
+            if p_m1['etat'] not in ('EPA', 'IPA') or p_m1['sens'] != sens_inverse:
+                continue
+            ts_m1 = candles_m1[p_m1['b_idx']].ts
+
+            if (now_ms - ts_m1) / 60000.0 > MAX_AGE_SIGNAL_MINUTES:
+                log_rejet(symbol, sens_inverse, ts_m1, "trop vieux (> MAX_AGE_SIGNAL_MINUTES)")
+                continue
+            if not (0 <= (ts_m1 - ts_b1) / 60000.0 <= MAX_ATTENTE_MINUTES):
+                log_rejet(symbol, sens_inverse, ts_m1, "délai B(H1)->M1 hors bornes")
+                continue
+
+            prix_entree = candles_m1[p_m1['b_idx']].close  # toujours Market
+            sl = p_m1['A']
+            tp = B1  # cible = le point B H1 qu'on vient de casser, jamais recalculé
+
+            if None in [prix_entree, sl, tp]:
+                continue
+            dist_sl = abs(prix_entree - sl)
+            if dist_sl < (prix_entree * 0.0005):
+                log_rejet(symbol, sens_inverse, ts_m1, "SL trop proche du prix d'entrée")
+                continue
+            rr_theorique = min(abs(tp - prix_entree) / dist_sl, 30.0)
+            if rr_theorique < RR_MIN:
+                log_rejet(symbol, sens_inverse, ts_m1, "RR insuffisant", rr=round(rr_theorique, 2))
+                continue
+
+            # Signal expiré si SL/TP déjà touché depuis sa formation
+            statut = None
+            ajustement = prix_entree * 0.0001
+            for m in range(p_m1['b_idx'] + 1, len(candles_m1)):
+                c_check = candles_m1[m]
+                if sens_inverse == 'haussier':
+                    if c_check.low <= (sl - ajustement) or c_check.high >= (tp - ajustement):
+                        statut = "EXPIRE"
+                        break
+                else:
+                    if c_check.high >= (sl + ajustement) or c_check.low <= (tp + ajustement):
+                        statut = "EXPIRE"
+                        break
+            if statut == "EXPIRE":
+                log_rejet(symbol, sens_inverse, ts_m1, "signal caduc (SL/TP déjà touché)")
+                continue
+
+            cle = f"{symbol}_{p_h1['b_idx']}_{p_m1['b_idx']}"
+            if cle in state:
+                log_rejet(symbol, sens_inverse, ts_m1, "déjà alerté")
+                continue
+
+            state[cle] = now_ms
+            nouveaux_signaux.append({
+                "symbol": symbol,
+                "sens": sens_inverse,
+                "prix_entree": prix_entree,
+                "sl": sl,
+                "tp": tp,
+                "rr": round(rr_theorique, 2),
+                "ts_m1": ts_m1,
+            })
+
+    return nouveaux_signaux
+
+
+def formater_message(sig, execution=None):
+    emoji = "🟢" if sig["sens"] == "haussier" else "🔴"
+    direction = "LONG" if sig["sens"] == "haussier" else "SHORT"
+    date_str = datetime.fromtimestamp(sig["ts_m1"] / 1000.0, tz=timezone.utc).astimezone(PARIS).strftime('%Y-%m-%d %H:%M')
+    base = (
+        f"{emoji} <b>[RETRACEMENT] {sig['symbol']} - {direction}</b>\n"
+        f"Entrée: {sig['prix_entree']:.4f}\n"
+        f"SL: {sig['sl']:.4f}\n"
+        f"TP: {sig['tp']:.4f}\n"
+        f"R:R ≈ 1:{sig['rr']}\n"
+        f"Détecté: {date_str} (Paris)"
+    )
+    if execution is None:
+        return base
+    if execution.get("ordre_place"):
+        base += "\n\n✅ <b>DEAL OUVERT SUR GAINIUM</b>"
+    else:
+        base += f"\n\n⛔ <b>NON EXÉCUTÉ</b> — {execution.get('raison', 'raison inconnue')}"
+    return base
+
+
+# =========================================================
+# MAIN
+# =========================================================
+def executer_scan(candles_h1_cache, state):
+    """Un passage complet : fetch M1 (H1 réutilisé depuis le cache), détection, exécution."""
+    tous_les_signaux = []
+    candles_par_symbole = {}
+
+    for actif in ACTIFS:
+        if not dans_plage_active(actif):
+            continue
+        c_h1 = candles_h1_cache[actif]
+        c_m1 = fetch(actif, "1m", JOURS_M1)
+        candles_par_symbole[actif] = c_m1
+        signaux = detecter_signaux(actif, c_h1, c_m1, state)
+        tous_les_signaux.extend(signaux)
+        time.sleep(0.3)
+
+    if EXECUTION_REELLE:
+        surveiller_positions_ouvertes(state, candles_par_symbole)
+
+    if tous_les_signaux:
+        for sig in tous_les_signaux:
+            execution = None
+            if EXECUTION_REELLE:
+                resultat = ouvrir_position_gainium(sig["symbol"], sig["sens"])
+                if resultat["succes"]:
+                    execution = {"ordre_place": True}
+                    positions = state.setdefault("_positions_ouvertes", {})
+                    positions[f"{sig['symbol']}_{sig['sens']}_{sig['ts_m1']}"] = {
+                        "symbol": sig["symbol"],
+                        "sens": sig["sens"],
+                        "sl": sig["sl"],
+                        "tp": sig["tp"],
+                        "ts_ouverture": sig["ts_m1"],
+                    }
+                else:
+                    execution = {"ordre_place": False, "raison": f"échec webhook Gainium: {resultat['erreur']}"}
+
+            msg = formater_message(sig, execution)
+            print(msg)
+            envoyer_telegram(msg)
+    else:
+        print("Aucun nouveau signal M1 ce run.")
+
+    return candles_h1_cache
+
+
+def main():
+    if not acquerir_verrou():
+        return
+
+    try:
+        state = charger_state()
+        gerer_heartbeat_quotidien(state)
+
+        # 1er passage : fetch H1 (une fois) + M1, détection normale
+        candles_h1_cache = {}
+        for actif in ACTIFS:
+            if dans_plage_active(actif):
+                candles_h1_cache[actif] = fetch(actif, "1h", JOURS_H1)
+        executer_scan(candles_h1_cache, state)
+        sauver_state(state)
+
+        # Vérifie s'il faut passer en mode "boucle rapide" (biais H1 récent en attente de confirmation)
+        debut_boucle = time.time()
+        while True:
+            deadlines = []
+            for actif, c_h1 in candles_h1_cache.items():
+                deadline = detecter_biais_h1_en_attente(c_h1)
+                if deadline:
+                    deadlines.append(deadline)
+
+            if not deadlines:
+                break  # aucun biais récent en attente -> on repasse la main au cron normal (5 min)
+
+            if time.time() - debut_boucle > DUREE_MAX_BOUCLE_SEC:
+                print("⏱️ Garde-fou : boucle rapide interrompue après durée maximale.")
+                break
+
+            plus_proche_deadline = min(deadlines) / 1000.0
+            if time.time() >= plus_proche_deadline:
+                break  # la fenêtre d'attente est passée, rien de plus à surveiller rapidement
+
+            print(f"⚡ Biais H1 récent en attente de confirmation M1 — vérification rapide (toutes les {INTERVALLE_ATTENTE_RAPIDE_SEC}s)...")
+            time.sleep(INTERVALLE_ATTENTE_RAPIDE_SEC)
+
+            state = charger_state()
+            executer_scan(candles_h1_cache, state)
+            sauver_state(state)
+
+    finally:
+        liberer_verrou()
+
+
+if __name__ == "__main__":
+    main()
