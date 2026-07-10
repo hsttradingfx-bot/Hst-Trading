@@ -28,7 +28,8 @@ PLAGES_ACTIVES = {}
 STATE_FILE = os.path.join(os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "."), "state_m1.json")
 STATE_MAX_AGE_JOURS = 2           # les positions M1 se résolvent vite, purge plus rapide
 
-LOG_VERBOSE = True
+LOG_VERBOSE = False               # False par défaut ici : trop de comparaisons H1×M1 sur plusieurs jours,
+                                   # passe à True seulement si tu dois débugger un run précis
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
