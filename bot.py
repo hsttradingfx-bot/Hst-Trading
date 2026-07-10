@@ -1,17 +1,12 @@
-import pandas as pd
-import numpy as np
-import json, time, os, hmac, hashlib, urllib.request, urllib.parse
+import json, time, os, urllib.request, urllib.parse
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 PARIS = ZoneInfo("Europe/Paris")
 BYBIT_URL = "https://api.bybit.eu/v5/market/kline"
 
-# Bybit utilise des codes d'intervalle différents de Binance
 BYBIT_INTERVALS = {
-    "4h": "240",
     "1h": "60",
-    "5m": "5",
     "1m": "1",
 }
 
@@ -19,74 +14,57 @@ BYBIT_INTERVALS = {
 # CONFIG
 # =========================================================
 ACTIFS = ["BTCUSDC", "ETHUSDC", "BNBUSDC", "SOLUSDC"]
-JOURS_H4 = 90     # historique nécessaire pour resynchroniser le détecteur H4
-JOURS_H1 = 45
-JOURS_M5 = 8
+JOURS_H1 = 45     # historique nécessaire pour resynchroniser le détecteur H1
+JOURS_M1 = 5      # M1 = énorme volume de bougies, on limite à quelques jours pour resynchroniser
 
-MAX_ATTENTE_MINUTES = 1440       # délai max entre point H1 et confirmation M5
-MAX_AGE_SIGNAL_MINUTES = 240     # on ignore les setups M5 trop vieux (> 4h)
-RR_MIN = 2.0
+MAX_ATTENTE_MINUTES = 180        # délai max entre le point H1 et la confirmation M1
+MAX_AGE_SIGNAL_MINUTES = 30      # un signal M1 périme vite, on ignore les setups trop vieux
+RR_MIN = 1.5
 
-# Plage(s) horaire(s) active(s) PAR ACTIF (heure de Paris).
-# Chaque actif a une LISTE de plages (debut, fin) - une ou plusieurs.
-PLAGES_ACTIVES = {
-    "BTCUSDC": [(9, 12), (14, 16)],
-    "ETHUSDC": [(9, 12), (14, 16)],
-    "BNBUSDC": [(14, 16)],  # Exclu le matin, actif l'après-midi
-    "SOLUSDC": [(14, 16)]   # Exclu le matin, actif l'après-midi
-}
+# Pas de filtre horaire par défaut (le backtest tournait 24h/24).
+# Ajoute des plages ici si tu veux restreindre, ex: "BTCUSDC": [(9, 22)]
+PLAGES_ACTIVES = {}
 
+STATE_FILE = os.path.join(os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "."), "state_m1.json")
+STATE_MAX_AGE_JOURS = 2           # les positions M1 se résolvent vite, purge plus rapide
 
-STATE_FILE = os.path.join(os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "."), "state.json")
-STATE_MAX_AGE_JOURS = 5           # purge des vieilles clés d'état
+LOCK_FILE = os.path.join(os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "."), "bot_m1.lock")
+INTERVALLE_ATTENTE_RAPIDE_SEC = 60   # fréquence de revérification pendant une fenêtre de confirmation active
+DUREE_MAX_BOUCLE_SEC = 200 * 60      # garde-fou absolu (un peu au-dessus de MAX_ATTENTE_MINUTES)
 
-LOCK_FILE = os.path.join(os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "."), "bot.lock")
-INTERVALLE_ATTENTE_RAPIDE_SEC = 5 * 60   # revérification M5 toutes les 5 min pendant une attente active
-# Le MAX_ATTENTE_MINUTES réel (1440 = 24h) est trop long pour boucler en continu sans interruption
-# (ça ferait ~288 fetch M5 par actif rien que pour cette attente). On limite la boucle rapide à une
-# fenêtre plus réaliste, alignée sur MAX_AGE_SIGNAL_MINUTES — au-delà, le cron normal (15 min) reprend la main.
-DUREE_MAX_ATTENTE_RAPIDE_MINUTES = 240
-DUREE_MAX_BOUCLE_SEC = (DUREE_MAX_ATTENTE_RAPIDE_MINUTES + 20) * 60  # garde-fou
-
-LOG_VERBOSE = True                # passe à False pour des logs plus courts
+LOG_VERBOSE = False               # False par défaut ici : trop de comparaisons H1×M1 sur plusieurs jours,
+                                   # passe à True seulement si tu dois débugger un run précis
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 # =========================================================
-# EXÉCUTION VIA GAINIUM (webhooks) — plus d'accès direct à l'API Bybit
+# EXÉCUTION VIA GAINIUM (webhooks) — bots séparés du 1er robot
 # =========================================================
 GAINIUM_WEBHOOK_URL = "https://api.gainium.io/trade_signal"
 EXECUTION_REELLE = True
 
-# Un bot Gainium = une direction fixe (Long ou Short) pour un actif donné.
-# On a donc 2 bots par actif : haussier -> bot Long, baissier -> bot Short.
+# ⚠️ À REMPLIR avec les 8 vrais UUID une fois les bots créés sur Gainium
 BOT_IDS = {
-    "BTCUSDC": {"haussier": "6a500c50ebbae511728a486b", "baissier": "6a5011baebbae5117291ec93"},
-    "ETHUSDC": {"haussier": "6a500ea2ebbae511728d9589", "baissier": "6a501190ebbae5117291b4a3"},
-    "SOLUSDC": {"haussier": "6a500fa2ebbae511728ef791", "baissier": "6a501512ebbae5117296aa9b"},
-    "BNBUSDC": {"haussier": "6a5010f4ebbae5117290da6f", "baissier": "6a5015e6ebbae5117297d951"},
+    "BTCUSDC": {"haussier": "6a50494cebbae51172e1831b", "baissier": "6a5049cfebbae51172e23eb4"},
+    "ETHUSDC": {"haussier": "6a504a6cebbae51172e31d79", "baissier": "6a504a63ebbae51172e3102f"},
+    "BNBUSDC": {"haussier": "6a504a91ebbae51172e3503e", "baissier": "6a504a95ebbae51172e35693"},
+    "SOLUSDC": {"haussier": "6a504a35ebbae51172e2cbf9", "baissier": "6a504a3aebbae51172e2d30a"},
 }
-
-RISQUE_PAR_PLAGE = {
-    (9, 12): 0.02,
-    (14, 16): 0.05,
-}
-RISQUE_PAR_DEFAUT = 0.02
 
 
 def acquerir_verrou():
-    """Empêche deux exécutions simultanées (le cron externe à 15 min pourrait se
-    déclencher pendant que la boucle rapide interne tourne encore)."""
+    """Empêche deux exécutions simultanées (le cron externe pourrait se déclencher
+    pendant que la boucle rapide interne tourne encore)."""
     if os.path.exists(LOCK_FILE):
         try:
             with open(LOCK_FILE, "r") as f:
                 ancien_pid = int(f.read().strip())
-            os.kill(ancien_pid, 0)
+            os.kill(ancien_pid, 0)  # ne tue rien, vérifie juste si le processus existe encore
             print(f"⏸️ Une autre exécution (PID {ancien_pid}) tourne déjà — on quitte proprement.")
             return False
         except (ValueError, ProcessLookupError, OSError):
-            pass
+            pass  # le verrou est périmé (processus mort), on l'ignore et on le remplace
     with open(LOCK_FILE, "w") as f:
         f.write(str(os.getpid()))
     return True
@@ -102,7 +80,7 @@ def liberer_verrou():
 
 def detecter_biais_h1_en_attente(candles_h1):
     """Retourne l'horodatage limite (deadline) au-delà duquel il n'est plus utile
-    de revérifier rapidement le M5 pour ce symbole, ou None si rien de récent."""
+    d'attendre une confirmation M1 pour ce symbole, ou None si rien de récent."""
     d_h1 = Det(); d_h1.update(candles_h1)
     now_ms = int(time.time() * 1000)
     deadline_la_plus_tardive = None
@@ -110,23 +88,23 @@ def detecter_biais_h1_en_attente(candles_h1):
         if p_h1['etat'] != 'EPA':
             continue
         ts_val_h1 = candles_h1[p_h1['b_idx']].ts
-        deadline = ts_val_h1 + DUREE_MAX_ATTENTE_RAPIDE_MINUTES * 60000
+        deadline = ts_val_h1 + MAX_ATTENTE_MINUTES * 60000
         if now_ms < deadline:
             if deadline_la_plus_tardive is None or deadline > deadline_la_plus_tardive:
                 deadline_la_plus_tardive = deadline
     return deadline_la_plus_tardive
 
 
-
+def log_rejet(symbol, sens, ts_conf, raison, **details):
     if not LOG_VERBOSE:
         return
     date_str = datetime.fromtimestamp(ts_conf / 1000.0, tz=timezone.utc).astimezone(PARIS).strftime('%Y-%m-%d %H:%M')
     extra = " ".join(f"{k}={v}" for k, v in details.items())
-    print(f"   ✗ REJET {symbol} [{sens}] signal M5 {date_str} -> {raison} {extra}")
+    print(f"   ✗ REJET {symbol} [{sens}] signal M1 {date_str} -> {raison} {extra}")
 
 
 # =========================================================
-# STRUCTURE DE DONNÉES CANDLE + DÉTECTEUR
+# CANDLE + DÉTECTEUR (identique au bot principal)
 # =========================================================
 class Candle:
     def __init__(self, ts, o, h, l, c):
@@ -288,15 +266,10 @@ class Det:
 # FETCH BYBIT
 # =========================================================
 def fetch(symbol, interval, days):
-    """
-    Récupère des bougies depuis Bybit EU (category=spot, cohérent avec l'exécution des ordres).
-    `interval` reste au format Binance ("4h", "1h", "5m", "1m") pour ne pas
-    changer le reste du code — la conversion vers le code Bybit se fait ici.
-    """
     interval_code = BYBIT_INTERVALS[interval]
     end_ts = int(time.time() * 1000)
     start_ts = end_ts - days * 86400000
-    lignes = {}  # dédoublonnage par timestamp
+    lignes = {}
     cur_end = end_ts
     attempts = 0
 
@@ -335,30 +308,8 @@ def fetch(symbol, interval, days):
     return candles
 
 
-def construire_timeline_sens(candles, historique):
-    timeline = []
-    sens_courant = None
-    for p in historique:
-        if p['etat'] == 'changement_tendance':
-            sens_courant = 'baissier' if p['sens'] == 'haussier' else 'haussier'
-        else:
-            sens_courant = p['sens']
-        timeline.append((candles[p['b_idx']].ts, sens_courant))
-    return timeline
-
-
-def sens_a_la_date(timeline, ts_cible):
-    resultat = "neutre"
-    for ts, sens in timeline:
-        if ts <= ts_cible:
-            resultat = sens
-        else:
-            break
-    return resultat
-
-
 # =========================================================
-# ETAT (anti-doublons entre les runs)
+# ÉTAT (anti-doublons + positions ouvertes)
 # =========================================================
 def charger_state():
     if os.path.exists(STATE_FILE):
@@ -376,7 +327,7 @@ def sauver_state(state):
     state_purge = {}
     for k, v in state.items():
         if k == "_positions_ouvertes":
-            state_purge[k] = v  # structure différente, pas de purge par timestamp
+            state_purge[k] = v
         elif now_ms - v <= max_age_ms:
             state_purge[k] = v
     with open(STATE_FILE, "w") as f:
@@ -384,51 +335,44 @@ def sauver_state(state):
 
 
 # =========================================================
-# WEBHOOKS GAINIUM (exécution des trades)
+# WEBHOOKS GAINIUM
 # =========================================================
 def envoyer_webhook_gainium(action, bot_uuid):
     payload = json.dumps({"action": action, "uuid": bot_uuid}).encode()
     req = urllib.request.Request(GAINIUM_WEBHOOK_URL, data=payload, headers={"Content-Type": "application/json"})
     try:
         with urllib.request.urlopen(req, timeout=15) as r:
-            reponse = r.read().decode()
-            return {"succes": True, "reponse": reponse}
+            return {"succes": True, "reponse": r.read().decode()}
     except Exception as e:
         return {"succes": False, "erreur": str(e)}
 
 
 def ouvrir_position_gainium(symbol, sens):
     bot_uuid = BOT_IDS.get(symbol, {}).get(sens)
-    if not bot_uuid:
-        return {"succes": False, "erreur": f"aucun bot Gainium configuré pour {symbol}/{sens}"}
+    if not bot_uuid or bot_uuid.startswith("REMPLACE_MOI"):
+        return {"succes": False, "erreur": f"bot_id non configuré pour {symbol}/{sens}"}
     return envoyer_webhook_gainium("startDeal", bot_uuid)
 
 
 def fermer_position_gainium(symbol, sens):
     bot_uuid = BOT_IDS.get(symbol, {}).get(sens)
-    if not bot_uuid:
-        return {"succes": False, "erreur": f"aucun bot Gainium configuré pour {symbol}/{sens}"}
+    if not bot_uuid or bot_uuid.startswith("REMPLACE_MOI"):
+        return {"succes": False, "erreur": f"bot_id non configuré pour {symbol}/{sens}"}
     return envoyer_webhook_gainium("closeDeal", bot_uuid)
 
 
 def surveiller_positions_ouvertes(state, candles_par_symbole):
-    """
-    Vérifie les positions ouvertes (suivies dans state) contre les dernières bougies
-    récupérées, et déclenche la clôture via webhook si le SL ou le TP est touché.
-    Pas d'accès direct à Bybit ici : on se base uniquement sur les prix publics déjà
-    récupérés pour la détection.
-    """
     positions = state.get("_positions_ouvertes", {})
     a_supprimer = []
 
     for cle, pos in positions.items():
         symbol = pos["symbol"]
-        candles_m5 = candles_par_symbole.get(symbol)
-        if not candles_m5:
+        candles_m1 = candles_par_symbole.get(symbol)
+        if not candles_m1:
             continue
 
         touche = None
-        for c in candles_m5:
+        for c in candles_m1:
             if c.ts <= pos["ts_ouverture"]:
                 continue
             if pos["sens"] == "haussier":
@@ -450,9 +394,9 @@ def surveiller_positions_ouvertes(state, candles_par_symbole):
             resultat = fermer_position_gainium(symbol, pos["sens"])
             emoji = "🔴" if touche == "SL" else "🟢"
             if resultat["succes"]:
-                envoyer_telegram(f"{emoji} {symbol} [{pos['sens']}] : {touche} touché, clôture envoyée à Gainium.")
+                envoyer_telegram(f"{emoji} [M1] {symbol} [{pos['sens']}] : {touche} touché, clôture envoyée à Gainium.")
             else:
-                envoyer_telegram(f"⚠️ {symbol} [{pos['sens']}] : {touche} touché mais échec de clôture Gainium ({resultat['erreur']}) — vérifie manuellement.")
+                envoyer_telegram(f"⚠️ [M1] {symbol} [{pos['sens']}] : {touche} touché mais échec de clôture Gainium ({resultat['erreur']}) — vérifie manuellement.")
             a_supprimer.append(cle)
 
     for cle in a_supprimer:
@@ -460,11 +404,19 @@ def surveiller_positions_ouvertes(state, candles_par_symbole):
     state["_positions_ouvertes"] = positions
 
 
-def obtenir_risque_pct(symbol, h_paris):
-    for debut, fin in PLAGES_ACTIVES.get(symbol, []):
-        if debut <= h_paris < fin:
-            return RISQUE_PAR_PLAGE.get((debut, fin), RISQUE_PAR_DEFAUT)
-    return None
+def dans_plage_active(symbol):
+    plages = PLAGES_ACTIVES.get(symbol)
+    if not plages:
+        return True  # pas de restriction par défaut pour la stratégie M1
+    h_paris = datetime.now(timezone.utc).astimezone(PARIS).hour
+    for debut, fin in plages:
+        if debut <= fin:
+            if debut <= h_paris < fin:
+                return True
+        else:
+            if h_paris >= debut or h_paris < fin:
+                return True
+    return False
 
 
 def envoyer_telegram(message):
@@ -487,19 +439,51 @@ def envoyer_telegram(message):
 
 
 # =========================================================
-# DETECTION DES SIGNAUX LIVE POUR UN ACTIF
+# DÉTECTION DES SIGNAUX LIVE (H1 biais+cible / M1 exécution)
 # =========================================================
-def detecter_signaux(symbol, candles_h4, candles_h1, candles_m5, state):
-    if not candles_h4 or not candles_h1 or not candles_m5:
+def detecter_signaux(symbol, candles_h1, candles_m1, state):
+    if not candles_h1 or not candles_m1:
         return []
 
-    d_h4 = Det(); d_h4.update(candles_h4)
     d_h1 = Det(); d_h1.update(candles_h1)
-    d_m5 = Det(); d_m5.update(candles_m5)
-    tl_h4 = construire_timeline_sens(candles_h4, d_h4.historique)
+    d_m1 = Det(); d_m1.update(candles_m1)
 
     now_ms = int(time.time() * 1000)
     nouveaux_signaux = []
 
     for p_h1 in d_h1.historique:
-        if p_h1['eta
+        if p_h1['etat'] != 'EPA':
+            continue
+        ts_val_h1 = candles_h1[p_h1['b_idx']].ts
+
+        for p_conf in d_m1.historique:
+            if p_conf['etat'] != 'EPA' or p_conf['sens'] != p_h1['sens']:
+                continue
+            ts_val_conf = candles_m1[p_conf['b_idx']].ts
+
+            if (now_ms - ts_val_conf) / 60000.0 > MAX_AGE_SIGNAL_MINUTES:
+                log_rejet(symbol, p_h1['sens'], ts_val_conf, "trop vieux (> MAX_AGE_SIGNAL_MINUTES)")
+                continue
+            if not (0 <= (ts_val_conf - ts_val_h1) / 60000.0 <= MAX_ATTENTE_MINUTES):
+                log_rejet(symbol, p_h1['sens'], ts_val_conf, "délai H1->M1 hors bornes")
+                continue
+
+            prix_entree = candles_m1[p_conf['b_idx']].close  # toujours Market
+            sl = p_conf['A']
+            tp = p_h1['B']
+
+            if None in [prix_entree, sl, tp]:
+                continue
+            dist_sl = abs(prix_entree - sl)
+            if dist_sl < (prix_entree * 0.0005):
+                log_rejet(symbol, p_h1['sens'], ts_val_conf, "SL trop proche du prix d'entrée")
+                continue
+            rr_theorique = min(abs(tp - prix_entree) / dist_sl, 30.0)
+            if rr_theorique < RR_MIN:
+                log_rejet(symbol, p_h1['sens'], ts_val_conf, "RR insuffisant", rr=round(rr_theorique, 2))
+                continue
+
+            # Signal expiré si SL/TP déjà touché depuis sa formation
+            statut = None
+            ajustement = prix_entree * 0.0001
+            for m in range
