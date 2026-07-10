@@ -6,11 +6,13 @@ PARIS = ZoneInfo("Europe/Paris")
 BINANCE_URL = "https://fapi.binance.com/fapi/v1/klines"
 
 ACTIFS = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT"]
-FENETRES_JOURS = [2000, 1000]  # on mesure sur les deux périodes demandées
+JOURS_WEEKLY_DAILY = 2000       # fenêtre principale demandée
+JOURS_FENETRE_M1 = 20           # fenêtre de recherche M1 après chaque confirmation Daily
+                                 # (large marge : la synchro M1 devrait se faire en heures, pas en semaines)
 
 
 # =========================================================
-# CANDLE + DÉTECTEUR (identique aux scripts précédents)
+# CANDLE + DÉTECTEUR
 # =========================================================
 class Candle:
     def __init__(self, ts, o, h, l, c):
@@ -169,11 +171,14 @@ class Det:
 
 
 # =========================================================
-# FETCH BINANCE (Weekly / Daily -> volumes légers, pas de pagination lourde)
+# FETCH BINANCE
 # =========================================================
-def fetch(symbol, interval, days):
-    end_ts = int(time.time() * 1000)
-    start_ts = end_ts - days * 86400000
+def fetch(symbol, interval, start_ts=None, end_ts=None, days=None):
+    if end_ts is None:
+        end_ts = int(time.time() * 1000)
+    if start_ts is None:
+        start_ts = end_ts - days * 86400000
+
     all_c = []
     cur = start_ts
     attempts = 0
@@ -203,12 +208,13 @@ def fetch(symbol, interval, days):
 
 
 # =========================================================
-# MESURE DE SYNCHRONISATION WEEKLY -> DAILY
+# ÉTAGE 1 : WEEKLY -> DAILY
 # =========================================================
-def mesurer_synchronisation(symbol, candles_w, candles_d):
+def mesurer_weekly_vers_daily(symbol, candles_w, candles_d):
     d_w = Det(); d_w.update(candles_w)
     d_d = Det(); d_d.update(candles_d)
 
+    confirmations = []  # liste des tuples validés pour l'étage suivant
     deltas_jours = []
     invalidations = 0
 
@@ -218,11 +224,7 @@ def mesurer_synchronisation(symbol, candles_w, candles_d):
         ts_w = candles_w[p_w['b_idx']].ts
         sens_w = p_w['sens']
         A_w = p_w['A']
-
-        # Cherche la première confirmation Daily EPA dans le même sens, après ts_w,
-        # sans que le prix Daily ne soit jamais revenu toucher le point A Weekly avant.
-        confirmation_trouvee = False
-        invalide = False
+        B_w = p_w['B']
 
         for p_d in d_d.historique:
             if p_d['etat'] != 'EPA' or p_d['sens'] != sens_w:
@@ -231,7 +233,6 @@ def mesurer_synchronisation(symbol, candles_w, candles_d):
             if ts_d <= ts_w:
                 continue
 
-            # Vérifie si le prix a touché le point A Weekly entre ts_w et ts_d
             touche_A = False
             for c in candles_d:
                 if c.ts <= ts_w or c.ts >= ts_d:
@@ -244,74 +245,145 @@ def mesurer_synchronisation(symbol, candles_w, candles_d):
                     break
 
             if touche_A:
-                invalide = True
-                break  # cette tentative de synchro est invalidée, on arrête pour ce point Weekly
+                invalidations += 1
+                break
 
             delta_jours = (ts_d - ts_w) / 86400000.0
             deltas_jours.append(delta_jours)
-            confirmation_trouvee = True
-            break  # on ne garde que la première confirmation valide
+            confirmations.append({
+                "symbol": symbol,
+                "sens": sens_w,
+                "ts_w": ts_w,
+                "A_w": A_w,
+                "B_w": B_w,
+                "ts_d": ts_d,
+                "A_d": p_d['A'],
+            })
+            break
 
-        if invalide and not confirmation_trouvee:
-            invalidations += 1
-
-    return deltas_jours, invalidations
+    return confirmations, deltas_jours, invalidations
 
 
-def stats(deltas):
-    if not deltas:
+# =========================================================
+# ÉTAGE 2 : DAILY -> M1
+# =========================================================
+def mesurer_daily_vers_m1(confirmation):
+    symbol = confirmation["symbol"]
+    sens = confirmation["sens"]
+    ts_d = confirmation["ts_d"]
+    A_d = confirmation["A_d"]
+
+    end_fenetre = ts_d + JOURS_FENETRE_M1 * 86400000
+    candles_m1 = fetch(symbol, "1m", start_ts=ts_d, end_ts=end_fenetre)
+    if not candles_m1:
+        return None, "pas_de_donnees"
+
+    d_m1 = Det(); d_m1.update(candles_m1)
+
+    for p_m1 in d_m1.historique:
+        if p_m1['etat'] != 'EPA' or p_m1['sens'] != sens:
+            continue
+        ts_m1 = candles_m1[p_m1['b_idx']].ts
+        if ts_m1 <= ts_d:
+            continue
+
+        touche_A = False
+        for c in candles_m1:
+            if c.ts <= ts_d or c.ts >= ts_m1:
+                continue
+            if sens == 'haussier' and c.low <= A_d:
+                touche_A = True
+                break
+            if sens == 'baissier' and c.high >= A_d:
+                touche_A = True
+                break
+
+        if touche_A:
+            return None, "invalide"
+
+        delta_heures = (ts_m1 - ts_d) / 3600000.0
+        return delta_heures, "ok"
+
+    return None, "aucune_confirmation_dans_la_fenetre"
+
+
+def stats(valeurs):
+    if not valeurs:
         return None
-    deltas_tries = sorted(deltas)
-    n = len(deltas_tries)
-    moyenne = sum(deltas_tries) / n
-    mediane = deltas_tries[n // 2] if n % 2 == 1 else (deltas_tries[n // 2 - 1] + deltas_tries[n // 2]) / 2
-    return {
-        "n": n,
-        "moyenne_jours": round(moyenne, 2),
-        "mediane_jours": round(mediane, 2),
-        "min_jours": round(deltas_tries[0], 2),
-        "max_jours": round(deltas_tries[-1], 2),
-    }
+    v = sorted(valeurs)
+    n = len(v)
+    moyenne = sum(v) / n
+    mediane = v[n // 2] if n % 2 == 1 else (v[n // 2 - 1] + v[n // 2]) / 2
+    return {"n": n, "moyenne": round(moyenne, 2), "mediane": round(mediane, 2), "min": round(v[0], 2), "max": round(v[-1], 2)}
 
 
 # =========================================================
 # RUN
 # =========================================================
 if __name__ == "__main__":
-    for jours in FENETRES_JOURS:
-        print(f"\n{'='*70}")
-        print(f"📊 FENÊTRE : {jours} JOURS")
-        print(f"{'='*70}")
+    toutes_confirmations = []
+    tous_deltas_wd = []
+    total_invalidations_wd = 0
 
-        tous_les_deltas = []
-        total_invalidations = 0
+    print("="*70)
+    print(f"ÉTAGE 1 : WEEKLY -> DAILY (fenêtre {JOURS_WEEKLY_DAILY}j)")
+    print("="*70)
 
-        for actif in ACTIFS:
-            print(f"\n[🚀] {actif} — récupération Weekly + Daily sur {jours}j...")
-            c_w = fetch(actif, "1w", jours)
-            c_d = fetch(actif, "1d", jours)
-            print(f"   ✓ {len(c_w)} bougies Weekly, {len(c_d)} bougies Daily")
+    for actif in ACTIFS:
+        print(f"\n[🚀] {actif} — Weekly + Daily...")
+        c_w = fetch(actif, "1w", days=JOURS_WEEKLY_DAILY)
+        c_d = fetch(actif, "1d", days=JOURS_WEEKLY_DAILY)
+        confirmations, deltas, invalidations = mesurer_weekly_vers_daily(actif, c_w, c_d)
+        print(f"   → {len(confirmations)} confirmations Daily valides, {invalidations} invalidées")
+        toutes_confirmations.extend(confirmations)
+        tous_deltas_wd.extend(deltas)
+        total_invalidations_wd += invalidations
+        time.sleep(0.3)
 
-            deltas, invalidations = mesurer_synchronisation(actif, c_w, c_d)
-            total_invalidations += invalidations
-            s = stats(deltas)
+    s_wd = stats(tous_deltas_wd)
+    print(f"\n📈 STATS ÉTAGE 1 (Weekly->Daily, en jours) :")
+    if s_wd:
+        print(f"   n={s_wd['n']} | moyenne={s_wd['moyenne']}j | médiane={s_wd['mediane']}j | min={s_wd['min']}j | max={s_wd['max']}j")
+    print(f"   invalidations : {total_invalidations_wd}")
 
-            if s:
-                print(f"   → {s['n']} synchronisations valides | moyenne: {s['moyenne_jours']}j | médiane: {s['mediane_jours']}j | min: {s['min_jours']}j | max: {s['max_jours']}j")
-            else:
-                print(f"   → Aucune synchronisation valide trouvée")
-            print(f"   → {invalidations} points Weekly invalidés avant confirmation Daily")
+    print("\n" + "="*70)
+    print(f"ÉTAGE 2 : DAILY -> M1 (fenêtre de recherche {JOURS_FENETRE_M1}j après chaque confirmation)")
+    print("="*70)
 
-            tous_les_deltas.extend(deltas)
-            time.sleep(0.3)
+    deltas_dm1 = []
+    invalidations_dm1 = 0
+    sans_confirmation = 0
 
-        print(f"\n{'-'*70}")
-        print(f"📈 RÉSULTAT GLOBAL ({jours} jours, tous actifs confondus)")
-        print(f"{'-'*70}")
-        s_global = stats(tous_les_deltas)
-        if s_global:
-            print(f"Nombre de synchronisations valides : {s_global['n']}")
-            print(f"Temps de synchronisation moyen      : {s_global['moyenne_jours']} jours")
-            print(f"Temps de synchronisation médian      : {s_global['mediane_jours']} jours")
-            print(f"Min / Max                           : {s_global['min_jours']}j / {s_global['max_jours']}j")
-        print(f"Total points Weekly invalidés avant confirmation : {total_invalidations}")
+    for i, conf in enumerate(toutes_confirmations, 1):
+        date_str = datetime.fromtimestamp(conf['ts_d'] / 1000.0, tz=timezone.utc).astimezone(PARIS).strftime('%Y-%m-%d')
+        print(f"[{i}/{len(toutes_confirmations)}] {conf['symbol']} [{conf['sens']}] confirmé le {date_str} — recherche M1...")
+        delta_h, statut = mesurer_daily_vers_m1(conf)
+        if statut == "ok":
+            deltas_dm1.append(delta_h)
+            print(f"      ✓ confirmation M1 après {round(delta_h, 1)}h")
+        elif statut == "invalide":
+            invalidations_dm1 += 1
+            print(f"      ✗ invalidé (prix revenu sur le point A du Daily)")
+        else:
+            sans_confirmation += 1
+            print(f"      ⏱️ aucune confirmation M1 trouvée dans la fenêtre de {JOURS_FENETRE_M1}j")
+        time.sleep(0.5)
+
+    s_dm1 = stats(deltas_dm1)
+    print(f"\n📈 STATS ÉTAGE 2 (Daily->M1, en heures) :")
+    if s_dm1:
+        print(f"   n={s_dm1['n']} | moyenne={s_dm1['moyenne']}h | médiane={s_dm1['mediane']}h | min={s_dm1['min']}h | max={s_dm1['max']}h")
+    print(f"   invalidations : {invalidations_dm1} | sans confirmation dans la fenêtre : {sans_confirmation}")
+
+    print("\n" + "="*70)
+    print("📊 RÉCAPITULATIF GLOBAL DE LA CASCADE WEEKLY -> DAILY -> M1")
+    print("="*70)
+    print(f"Points Weekly EPA de départ           : {len(tous_deltas_wd) + total_invalidations_wd}")
+    print(f"  → confirmés en Daily                : {len(toutes_confirmations)}")
+    print(f"  → invalidés avant confirmation Daily : {total_invalidations_wd}")
+    print(f"  → confirmés en M1 (trade complet)   : {len(deltas_dm1)}")
+    print(f"  → invalidés avant confirmation M1    : {invalidations_dm1}")
+    print(f"  → sans confirmation M1 (fenêtre expirée) : {sans_confirmation}")
+    if toutes_confirmations:
+        taux_final = round(len(deltas_dm1) / len(toutes_confirmations) * 100, 1)
+        print(f"\nTaux de conversion Daily -> trade complet (M1) : {taux_final}%")
