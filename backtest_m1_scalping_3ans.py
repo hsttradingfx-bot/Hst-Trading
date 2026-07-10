@@ -1,288 +1,321 @@
-import json, time, os, urllib.request, urllib.parse
-import pandas as pd
-import numpy as np
+import json, time, urllib.request
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 PARIS = ZoneInfo("Europe/Paris")
-BYBIT_URL = "https://api.bybit.eu/v5/market/kline"
-
-BYBIT_INTERVALS = {
-    "1h": "60",
-    "1m": "1",
-}
+BINANCE_URL = "https://fapi.binance.com/fapi/v1/klines"
 
 # =========================================================
-# CONFIG
+# CONFIG STRATEGIE SCALPING M1
 # =========================================================
-ACTIFS = ["BTCUSDC", "ETHUSDC", "BNBUSDC", "SOLUSDC"]
-JOURS_H1 = 45     # historique nécessaire pour resynchroniser le détecteur H1
-JOURS_M1 = 2      # RÉDUIT À 2 JOURS pour économiser le CPU et la RAM du VPS Vultr
+ACTIFS = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT"]
+JOURS_H1 = 200      # historique H1 (biais + niveau cible)
+JOURS_M1 = 60       # historique M1 (entrée + SL) - déjà volumineux en nb de bougies
 
-MAX_ATTENTE_MINUTES = 180        # délai max entre le point H1 et la confirmation M1
-MAX_AGE_SIGNAL_MINUTES = 30      # un signal M1 périme vite, on ignore les setups trop vieux
+MAX_ATTENTE_MINUTES = 180   # délai max entre le point H1 et la confirmation M1
+MAX_DUREE_TRADE_MINUTES = 180  # au-delà, on considère le trade en TIMEOUT
 RR_MIN = 1.5
 
-PLAGES_ACTIVES = {}
 
-STATE_FILE = os.path.join(os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "."), "state_m1.json")
-STATE_MAX_AGE_JOURS = 2           # les positions M1 se résolvent vite, purge plus rapide
-
-LOCK_FILE = os.path.join(os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "."), "bot_m1.lock")
-DUREE_MAX_BOUCLE_SEC = 270        # s'arrête un peu avant 5 min pour laisser le cron suivant prendre la main
-INTERVALLE_ATTENTE_RAPIDE_SEC = 30
-
-# Mettre ici tes identifiants de robots fournis par Gainium
-BOT_IDS = {
-    "BTCUSDC": "6a500c500000000000000001",
-    "ETHUSDC": "6a500c500000000000000002",
-    "BNBUSDC": "6a500c500000000000000003",
-    "SOLUSDC": "6a500c500000000000000004"
-}
-
+# =========================================================
+# CANDLE + DETECTEUR (identique à bot.py)
+# =========================================================
 class Candle:
-    def __init__(self, ts, open_p, high, low, close_p):
-        self.ts = ts
-        self.open = open_p
-        self.high = high
-        self.low = low
-        self.close = close_p
+    def __init__(self, ts, o, h, l, c):
+        self.ts, self.open, self.high, self.low, self.close = ts, o, h, l, c
+    @property
+    def is_bullish(self):
+        return self.close > self.open
+    @property
+    def is_bearish(self):
+        return self.close < self.open
+
 
 class Det:
-    def __init__(self, tf):
-        self.tf = tf
-        self.points = []
+    def __init__(self):
+        self.historique = []
+        self.sens = None
+        self.point_cle, self.point_cle_idx = None, None
+        self.niveau_continuation, self.niveau_continuation_idx = None, None
+        self.ext, self.ext_idx = None, None
+        self.stage = 0
+        self.stage_niveau_casse = None
+        self.stage_extreme, self.stage_extreme_idx = None, None
+        self.stage_retest = False
+        self.cont_stage = 0
+        self.tentative_haut, self.tentative_bas = None, None
+        self.niveau_casse = None
+        self.retest_confirme = False
+
     def update(self, candles):
-        if not candles:
+        self.historique = []
+        self.sens = None
+        self.stage = 0
+        self.cont_stage = 0
+        self.tentative_haut = None
+        self.tentative_bas = None
+        for i, c in enumerate(candles):
+            self._process(i, c)
+
+    def _process(self, i, c):
+        if self.sens is None:
+            if c.is_bearish:
+                self.sens = 'haussier'
+                self.point_cle, self.point_cle_idx = c.low, i
+                self.niveau_continuation, self.niveau_continuation_idx = c.high, i
+                self.ext, self.ext_idx = c.low, i
+            elif c.is_bullish:
+                self.sens = 'baissier'
+                self.point_cle, self.point_cle_idx = c.high, i
+                self.niveau_continuation, self.niveau_continuation_idx = c.low, i
+                self.ext, self.ext_idx = c.high, i
             return
-        # Simulation d'une détection de structure (vagues / retests)
-        # Remplace ou garde ta logique interne ici si elle était plus développée
-        self.points = [{"ts": candles[-1].ts, "type": "structure_valide", "prix": candles[-1].close}]
+        if self.sens == 'haussier':
+            self._ph(i, c)
+        else:
+            self._pb(i, c)
 
-def acquerir_verrou():
-    if os.path.exists(LOCK_FILE):
-        try:
-            with open(LOCK_FILE, "r") as f:
-                pid = int(f.read().strip())
-            os.kill(pid, 0)
-            return False
-        except (OSError, ValueError):
-            pass
-    with open(LOCK_FILE, "w") as f:
-        f.write(str(os.getpid()))
-    return True
+    def _ph(self, i, c):
+        if c.low < self.ext:
+            self.ext, self.ext_idx = c.low, i
+        if self.cont_stage == 0:
+            if c.high > self.niveau_continuation:
+                if self.tentative_haut is None or c.high > self.tentative_haut:
+                    self.tentative_haut = c.high
+                if c.is_bearish:
+                    self.cont_stage = 1
+                    self.niveau_casse = self.niveau_continuation
+                    self.retest_confirme = False
+        elif self.cont_stage == 1:
+            if c.is_bearish and c.close <= self.niveau_casse:
+                self.retest_confirme = True
+            if c.high > self.tentative_haut:
+                e = 'EPA' if self.retest_confirme else 'IPA'
+                self.historique.append({'sens': 'haussier', 'A': self.ext, 'a_idx': self.ext_idx, 'B': c.high, 'b_idx': i, 'etat': e})
+                self.point_cle, self.point_cle_idx = self.ext, self.ext_idx
+                self.niveau_continuation, self.niveau_continuation_idx = c.high, i
+                self.ext, self.ext_idx = c.low, i
+                self.cont_stage = 0
+                self.tentative_haut = None
+                return
+        if self.stage == 0:
+            if c.low < self.point_cle:
+                if self.stage_extreme is None or c.low < self.stage_extreme:
+                    self.stage_extreme, self.stage_extreme_idx = c.low, i
+                if c.is_bullish:
+                    self.stage = 1
+                    self.stage_niveau_casse = self.point_cle
+                    self.stage_retest = False
+        elif self.stage == 1:
+            if c.is_bullish and c.close >= self.stage_niveau_casse:
+                self.stage_retest = True
+            if c.high > self.niveau_continuation:
+                self.stage = 0
+                self.stage_extreme = None
+            elif c.low < self.stage_extreme:
+                etat_ct = 'EPA' if self.stage_retest else 'IPA'
+                self.historique.append({'sens': 'haussier', 'A': self.point_cle, 'a_idx': self.point_cle_idx, 'B': c.low, 'b_idx': i, 'etat': 'changement_tendance', 'sous_etat': etat_ct})
+                self.sens = 'baissier'
+                self.point_cle, self.point_cle_idx = self.niveau_continuation, self.niveau_continuation_idx
+                self.niveau_continuation, self.niveau_continuation_idx = c.low, i
+                self.ext, self.ext_idx = c.high, i
+                self.stage = 0
+                self.stage_extreme = None
+                self.cont_stage = 0
+                self.tentative_haut = None
+                self.tentative_bas = None
 
-def relacher_verrou():
-    if os.path.exists(LOCK_FILE):
-        try:
-            os.remove(LOCK_FILE)
-        except OSError:
-            pass
+    def _pb(self, i, c):
+        if c.high > self.ext:
+            self.ext, self.ext_idx = c.high, i
+        if self.cont_stage == 0:
+            if c.low < self.niveau_continuation:
+                if self.tentative_bas is None or c.low < self.tentative_bas:
+                    self.tentative_bas = c.low
+                if c.is_bullish:
+                    self.cont_stage = 1
+                    self.niveau_casse = self.niveau_continuation
+                    self.retest_confirme = False
+        elif self.cont_stage == 1:
+            if c.is_bullish and c.close >= self.niveau_casse:
+                self.retest_confirme = True
+            if c.low < self.tentative_bas:
+                e = 'EPA' if self.retest_confirme else 'IPA'
+                self.historique.append({'sens': 'baissier', 'A': self.ext, 'a_idx': self.ext_idx, 'B': c.low, 'b_idx': i, 'etat': e})
+                self.point_cle, self.point_cle_idx = self.ext, self.ext_idx
+                self.niveau_continuation, self.niveau_continuation_idx = c.low, i
+                self.ext, self.ext_idx = c.high, i
+                self.cont_stage = 0
+                self.tentative_bas = None
+                return
+        if self.stage == 0:
+            if c.high > self.point_cle:
+                if self.stage_extreme is None or c.high > self.stage_extreme:
+                    self.stage_extreme, self.stage_extreme_idx = c.high, i
+                if c.is_bearish:
+                    self.stage = 1
+                    self.stage_niveau_casse = self.point_cle
+                    self.stage_retest = False
+        elif self.stage == 1:
+            if c.is_bearish and c.close <= self.stage_niveau_casse:
+                self.stage_retest = True
+            if c.low < self.niveau_continuation:
+                self.stage = 0
+                self.stage_extreme = None
+            elif c.high > self.stage_extreme:
+                etat_ct = 'EPA' if self.stage_retest else 'IPA'
+                self.historique.append({'sens': 'baissier', 'A': self.point_cle, 'a_idx': self.point_cle_idx, 'B': c.high, 'b_idx': i, 'etat': 'changement_tendance', 'sous_etat': etat_ct})
+                self.sens = 'haussier'
+                self.point_cle, self.point_cle_idx = self.niveau_continuation, self.niveau_continuation_idx
+                self.niveau_continuation, self.niveau_continuation_idx = c.high, i
+                self.ext, self.ext_idx = c.low, i
+                self.stage = 0
+                self.stage_extreme = None
+                self.cont_stage = 0
+                self.tentative_haut = None
+                self.tentative_bas = None
 
-def dans_plage_active(actif):
-    if actif not in PLAGES_ACTIVES or not PLAGES_ACTIVES[actif]:
-        return True
-    maintenant = datetime.now(PARIS)
-    heure_actuelle = maintenant.hour
-    for debut, fin in PLAGES_ACTIVES[actif]:
-        if debut <= heure_actuelle < fin:
-            return True
-    return False
 
-def fetch(actif, intervalle, jours_back):
-    lignes = []
-    limit = 1000
-    now_ms = int(time.time() * 1000)
-    start_ts = now_ms - (jours_back * 24 * 60 * 60 * 1000)
-    cur_end = now_ms
+# =========================================================
+# FETCH BINANCE
+# =========================================================
+def fetch(symbol, interval, days):
+    end_ts = int(time.time() * 1000)
+    start_ts = end_ts - days * 86400000
+    all_c = []
+    cur = start_ts
     attempts = 0
-
-    while cur_end > start_ts:
-        params = {
-            "category": "linear",
-            "symbol": actif,
-            "interval": BYBIT_INTERVALS[intervalle],
-            "end": str(cur_end),
-            "limit": str(limit)
-        }
-        url = f"{BYBIT_URL}?{urllib.parse.urlencode(params)}"
+    while cur < end_ts:
+        url = f"{BINANCE_URL}?symbol={symbol}&interval={interval}&startTime={cur}&endTime={end_ts}&limit=1000"
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
         try:
-            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-            with urllib.request.urlopen(req, timeout=10) as response:
-                data = json.loads(response.read().decode())
-                if data.get("retCode") == 0 and data.get("result", {}).get("list"):
-                    rows = data["result"]["list"]
-                    lignes.extend(rows)
-                    oldest_ts = min(int(row[0]) for row in rows)
-                    if oldest_ts <= start_ts or oldest_ts >= cur_end:
-                        break
-                    cur_end = oldest_ts
-                else:
-                    break
+            with urllib.request.urlopen(req, timeout=15) as r:
+                data = json.loads(r.read().decode())
+            if not data:
+                break
+            for k in data:
+                all_c.append(Candle(k[0], float(k[1]), float(k[2]), float(k[3]), float(k[4])))
+            last = data[-1][0]
+            if last <= cur:
+                break
+            cur = last + 1
+            attempts = 0
+            time.sleep(0.1)
         except Exception:
             attempts += 1
             if attempts > 3:
                 break
             time.sleep(1.5)
             continue
+    return all_c
 
-    # SÉCURITÉ CRITIQUE : Si Bybit n'a rien renvoyé (coupure internet), on coupe pour ne pas effacer le JSON
-    if not lignes:
-        print(f"⚠️ Erreur réseau sur {actif} ({intervalle}). Scan annulé pour cet actif.")
-        return []
 
-    ts_valides = sorted(list(set(int(row[0]) for row in lignes)))
-    dict_lignes = {int(row[0]): row for row in lignes}
-    
-    candles = []
-    for ts in ts_valides:
-        row = dict_lignes[ts]
-        candles.append(Candle(ts, float(row[1]), float(row[2]), float(row[3]), float(row[4])))
-    return candles
+# =========================================================
+# BACKTEST STRATEGIE SCALPING M1 (biais+cible H1, exécution M1)
+# =========================================================
+def executer_backtest_actif(symbol, candles_h1, candles_m1):
+    if not candles_h1 or not candles_m1:
+        return 0, 0.0, 0.0, 10000.0
 
-def charger_state():
-    if not os.path.exists(STATE_FILE):
-        return {"alertes_h1": {}, "positions": {}}
-    try:
-        with open(STATE_FILE, "r") as f:
-            return json.load(f)
-    except Exception:
-        return {"alertes_h1": {}, "positions": {}}
+    d_h1 = Det(); d_h1.update(candles_h1)
+    d_m1 = Det(); d_m1.update(candles_m1)
 
-def sauver_state(state):
-    now_ts = int(time.time() * 1000)
-    limite_ts = now_ts - (STATE_MAX_AGE_JOURS * 24 * 60 * 60 * 1000)
-    
-    state_purge = {"alertes_h1": {}, "positions": {}}
-    for k, v in state.get("alertes_h1", {}).items():
-        if v.get("ts", 0) >= limite_ts:
-            state_purge["alertes_h1"][k] = v
-    for k, v in state.get("positions", {}).items():
-        if v.get("ts_ouverture", 0) >= limite_ts:
-            state_purge["positions"][k] = v
+    capital = 10000.0
+    risque_pourcent = 0.01
+    total_trades = 0
+    gains = 0
+    rr_list = []
+    ts_fin_dernier_trade = 0
 
-    # ÉCRITURE ATOMIQUE SÉCURISÉE (Anti-crash VPS)
-    with open(STATE_FILE + ".tmp", "w") as f:
-        json.dump(state_purge, f)
-    os.replace(STATE_FILE + ".tmp", STATE_FILE)
+    print(f"\n=======================================================")
+    print(f"📜 LISTE DES TRADES SCALPING M1 POUR {symbol}")
+    print("=======================================================")
 
-def envoyer_signal_gainium(actif, action):
-    bot_uuid = BOT_IDS.get(actif)
-    if not bot_uuid:
-        return
-    url = "https://api.gainium.io/trade_signal"
-    payload = json.dumps({"action": action, "uuid": bot_uuid})
-    req = urllib.request.Request(
-        url, 
-        data=payload.encode('utf-8'),
-        headers={'Content-Type': 'application/json', 'User-Agent': 'Mozilla/5.0'},
-        method='POST'
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=10) as response:
-            print(f"🚀 Webhook Gainium envoyé pour {actif} ({action}) : {response.read().decode()}")
-    except Exception as e:
-        print(f"❌ Échec de l'envoi du webhook Gainium pour {actif} : {e}")
-
-def detecter_biais_h1_en_attente(candles_h1):
-    if not candles_h1:
-        return None
-    det_h1 = Det("1h")
-    det_h1.update(candles_h1)
-    if not det_h1.points:
-        return None
-    dernier_point = det_h1.points[-1]
-    return dernier_point["ts"] + (MAX_ATTENTE_MINUTES * 60 * 1000)
-
-def executer_scan(candles_h1_cache, state):
-    now_ms = int(time.time() * 1000)
-    
-    for actif in ACTIFS:
-        if not dans_plage_active(actif):
+    for p_h1 in d_h1.historique:
+        if p_h1['etat'] != 'EPA':
             continue
-            
-        candles_h1 = candles_h1_cache.get(actif, [])
-        if not candles_h1:
-            continue
-            
-        det_h1 = Det("1h")
-        det_h1.update(candles_h1)
-        if not det_h1.points:
-            continue
-            
-        dernier_p_h1 = det_h1.points[-1]
-        age_h1_min = (now_ms - dernier_p_h1["ts"]) / 60000.0
-        
-        if age_h1_min > MAX_ATTENTE_MINUTES:
-            continue
-            
-        # Si on est dans les temps du biais H1, on scanne le M1 pour chercher l'entrée exacte
-        candles_m1 = fetch(actif, "1m", JOURS_M1)
-        if not candles_m1:
-            continue
-            
-        det_m1 = Det("1m")
-        det_m1.update(candles_m1)
-        if not det_m1.points:
-            continue
-            
-        dernier_p_m1 = det_m1.points[-1]
-        age_m1_min = (now_ms - dernier_p_m1["ts"]) / 60000.0
-        
-        if age_m1_min <= MAX_AGE_SIGNAL_MINUTES:
-            # S'il n'y a pas déjà de position ouverte, on envoie le signal à Gainium
-            if actif not in state["positions"]:
-                print(f"🎯 SIGNAL APPROUVÉ sur {actif} ! Alignement H1/M1 détecté.")
-                envoyer_signal_gainium(actif, "startDeal")
-                state["positions"][actif] = {
-                    "ts_ouverture": now_ms,
-                    "prix_entree": candles_m1[-1].close
-                }
+        ts_val_h1 = candles_h1[p_h1['b_idx']].ts
 
-def main():
-    if not acquerir_verrou():
-        print("⚠️ Une instance du bot tourne déjà. Fin du script.")
-        return
+        for p_conf in d_m1.historique:
+            if p_conf['etat'] != 'EPA' or p_conf['sens'] != p_h1['sens']:
+                continue
+            ts_val_conf = candles_m1[p_conf['b_idx']].ts
 
-    try:
-        state = charger_state()
-        candles_h1_cache = {}
-        
-        for actif in ACTIFS:
-            if dans_plage_active(actif):
-                candles_h1_cache[actif] = fetch(actif, "1h", JOURS_H1)
-                
-        executer_scan(candles_h1_cache, state)
-        sauver_state(state)
+            if ts_val_conf < ts_fin_dernier_trade:
+                continue
+            if not (0 <= (ts_val_conf - ts_val_h1) / 60000.0 <= MAX_ATTENTE_MINUTES):
+                continue
 
-        debut_boucle = time.time()
-        while True:
-            deadlines = []
-            for actif, c_h1 in candles_h1_cache.items():
-                deadline = detecter_biais_h1_en_attente(c_h1)
-                if deadline:
-                    deadlines.append(deadline)
+            prix_entree = candles_m1[p_conf['b_idx']].close  # entrée Market uniquement
+            sl = p_conf['A']
+            tp = p_h1['B']
 
-            if not deadlines:
-                break
+            if None in [prix_entree, sl, tp]:
+                continue
+            dist_sl = abs(prix_entree - sl)
+            if dist_sl < (prix_entree * 0.0005):
+                continue
 
-            if time.time() - debut_boucle > DUREE_MAX_BOUCLE_SEC:
-                print("⏱️ Garde-fou : boucle rapide interrompue après durée maximale.")
-                break
+            rr_theorique = min(abs(tp - prix_entree) / dist_sl, 30.0)
+            if rr_theorique < RR_MIN:
+                continue
 
-            plus_proche_deadline = min(deadlines) / 1000.0
-            if time.time() >= plus_proche_deadline:
-                break
+            statut = None
+            ajustement = prix_entree * 0.0001
+            for m in range(p_conf['b_idx'] + 1, len(candles_m1)):
+                c_check = candles_m1[m]
+                if (c_check.ts - ts_val_conf) / 60000.0 > MAX_DUREE_TRADE_MINUTES:
+                    statut = "⏱️ TIMEOUT"
+                    break
+                if p_h1['sens'] == 'haussier':
+                    if c_check.low <= (sl - ajustement):
+                        statut = "❌ SL"
+                        break
+                    if c_check.high >= (tp - ajustement):
+                        statut = "✅ TP"
+                        break
+                else:
+                    if c_check.high >= (sl + ajustement):
+                        statut = "❌ SL"
+                        break
+                    if c_check.low <= (tp + ajustement):
+                        statut = "✅ TP"
+                        break
 
-            print(f"⚡ Biais H1 récent en attente — vérification rapide toutes les {INTERVALLE_ATTENTE_RAPIDE_SEC}s...")
-            time.sleep(INTERVALLE_ATTENTE_RAPIDE_SEC)
+            if statut:
+                total_trades += 1
+                pnl = (capital * risque_pourcent * rr_theorique) if "TP" in statut else (-capital * risque_pourcent)
+                capital += pnl if "TIMEOUT" not in statut else 0
+                if "TP" in statut:
+                    gains += 1
+                rr_list.append(rr_theorique)
+                ts_fin_dernier_trade = candles_m1[m].ts
+                date_str = datetime.fromtimestamp(ts_val_conf / 1000.0, tz=timezone.utc).astimezone(PARIS).strftime('%Y-%m-%d %H:%M')
+                print(f"Trade #{total_trades:<3} | {date_str} | R:R: 1:{round(rr_theorique,1):<4} | {statut}")
 
-            state = charger_state()
-            executer_scan(candles_h1_cache, state)
-            sauver_state(state)
+    return total_trades, round((gains/total_trades)*100 if total_trades else 0, 1), round(sum(rr_list)/len(rr_list) if rr_list else 0, 1), round(capital, 2)
 
-    finally:
-        relacher_verrou()
 
+# =========================================================
+# RUN GLOBAL
+# =========================================================
 if __name__ == "__main__":
-    main()
+    resultats_globaux = {}
+    for actif in ACTIFS:
+        print(f"\n[🚀] Récupération des données pour {actif}...")
+        c_h1 = fetch(actif, "1h", JOURS_H1)
+        c_m1 = fetch(actif, "1m", JOURS_M1)
+
+        trades, wr, rr, cap_final = executer_backtest_actif(actif, c_h1, c_m1)
+        resultats_globaux[actif] = {"trades": trades, "wr": wr, "rr": rr, "cap_final": cap_final}
+
+    print("\n=======================================================")
+    print(f"📊 SYNTHÈSE SCALPING M1 (H1 biais+cible / M1 exécution) — {JOURS_M1}J")
+    print("=======================================================")
+    print(f"{'Actif':<12} | {'Trades':<8} | {'Win Rate':<10} | {'R:R Moyen':<10} | {'Capital Final':<15}")
+    print("-" * 65)
+    for actif, res in resultats_globaux.items():
+        if res["trades"] > 0:
+            print(f"{actif:<12} | {res['trades']:<8} | {res['wr']}%     | {res['rr']:<10} | {res['cap_final']}$")
+    print("=======================================================")
+                
